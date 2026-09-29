@@ -11,8 +11,9 @@ from app.auth import AuthUser, current_user
 from app.database import Base, get_db
 import app.main as api_module
 from app.main import app, require_admin
-from app.models import (Article, ArticleTopic, DailyQuizAttempt, Profile, QuizOption,
-                        QuizQuestion, UserActivity, UserBookmark, UserRevision)
+from app.models import (Article, ArticleTopic, DailyQuizAttempt, LearningContent, Profile, QuizOption,
+                        QuizQuestion, Subject, Topic, UserActivity, UserBookmark, UserRevision,
+                        UserTopicProgress)
 from app.services.llm import MockProvider, get_provider, transform_source
 from app.services.streaks import streak_metrics
 
@@ -152,6 +153,46 @@ def test_profile_statistics_are_database_backed(harness):
     assert profile["questions_answered"] == 1
     assert profile["quiz_accuracy"] == 100
     assert profile["quizzes_completed"] == 1
+
+
+def test_learning_catalog_and_user_scoped_topic_progress(harness):
+    client, factory, user, _, _, _ = harness
+    db = factory()
+    subject = Subject(name="Indian Polity", slug="indian-polity", description="Constitution and institutions.",
+                      icon="landmark", color="#416c52", display_order=1, is_active=True)
+    db.add(subject); db.flush()
+    topic = Topic(subject_id=subject.id, name="Constitution Basics", slug="constitution-basics",
+                  description="Constitutional structure and values.", display_order=1, is_active=True)
+    db.add(topic); db.flush()
+    db.add(LearningContent(subject_id=subject.id, topic_id=topic.id, title="A first look at the Constitution",
+        slug="demo-constitution-basics", content_type="LESSON", summary="Demo lesson summary.",
+        body="Demo lesson body.", difficulty="FOUNDATION", estimated_minutes=8,
+        source="Prashna demo material", is_published=True))
+    db.commit(); db.close()
+
+    subjects = client.get("/api/subjects")
+    assert subjects.status_code == 200
+    assert subjects.json()[0]["slug"] == "indian-polity"
+    assert subjects.json()[0]["topic_count"] == 1
+    assert subjects.json()[0]["progress_percent"] == 0
+
+    subject_response = client.get("/api/subjects/indian-polity")
+    assert subject_response.json()["topics"][0]["slug"] == "constitution-basics"
+    topic_response = client.get("/api/topics/constitution-basics")
+    assert topic_response.json()["content"][0]["title"] == "A first look at the Constitution"
+    assert topic_response.json()["completed"] is False
+
+    assert client.post("/api/topics/constitution-basics/complete").json()["completed"] is True
+    assert client.post("/api/topics/constitution-basics/complete").json()["completed"] is True
+    db = factory()
+    assert db.query(UserTopicProgress).filter_by(user_id=user.id, topic_id=topic.id).count() == 1
+    db.close()
+    assert client.get("/api/subjects").json()[0]["progress_percent"] == 100
+
+    other_id = str(uuid4())
+    db = factory(); db.add(Profile(id=other_id, email="other@example.com")); db.commit(); db.close()
+    app.dependency_overrides[current_user] = lambda: AuthUser(other_id, "other@example.com", {}, {})
+    assert client.get("/api/subjects").json()[0]["progress_percent"] == 0
 
 
 def test_admin_ingestion_deduplicates_identical_source(harness, monkeypatch):

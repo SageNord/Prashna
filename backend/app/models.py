@@ -211,3 +211,80 @@ class UserActivity(Base):
     activity_date: Mapped[object] = mapped_column(Date, nullable=False)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class Subject(Base):
+    __tablename__ = "subjects"
+    __table_args__ = (
+        UniqueConstraint("slug", name="uq_subjects_slug"),
+        Index("ix_subjects_active_order", "is_active", "display_order"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    slug: Mapped[str] = mapped_column(String(140), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    icon: Mapped[str] = mapped_column(String(40), default="book-open", nullable=False)
+    color: Mapped[str] = mapped_column(String(24), default="#416c52", nullable=False)
+    display_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    topics: Mapped[list["Topic"]] = relationship(back_populates="subject", cascade="all, delete-orphan")
+
+
+class Topic(Base):
+    __tablename__ = "topics"
+    __table_args__ = (
+        UniqueConstraint("slug", name="uq_topics_slug"),
+        Index("ix_topics_subject_order", "subject_id", "display_order"),
+        Index("ix_topics_parent", "parent_topic_id"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subject_id: Mapped[int] = mapped_column(ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False)
+    parent_topic_id: Mapped[int | None] = mapped_column(ForeignKey("topics.id", ondelete="CASCADE"), nullable=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    slug: Mapped[str] = mapped_column(String(180), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    display_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    subject: Mapped[Subject] = relationship(back_populates="topics")
+    parent: Mapped["Topic | None"] = relationship(remote_side="Topic.id", back_populates="children")
+    children: Mapped[list["Topic"]] = relationship(back_populates="parent", cascade="all, delete-orphan")
+    content: Mapped[list["LearningContent"]] = relationship(back_populates="topic", cascade="all, delete-orphan")
+
+
+class LearningContent(Base):
+    __tablename__ = "learning_content"
+    __table_args__ = (
+        UniqueConstraint("slug", name="uq_learning_content_slug"),
+        Index("ix_learning_content_topic_published", "topic_id", "is_published"),
+        Index("ix_learning_content_subject_published", "subject_id", "is_published"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subject_id: Mapped[int] = mapped_column(ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id", ondelete="CASCADE"), nullable=False)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    slug: Mapped[str] = mapped_column(String(260), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(32), default="LESSON", nullable=False)
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    body: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    difficulty: Mapped[str] = mapped_column(String(24), default="FOUNDATION", nullable=False)
+    estimated_minutes: Mapped[int] = mapped_column(Integer, default=10, nullable=False)
+    source: Mapped[str] = mapped_column(String(200), default="Prashna demo material", nullable=False)
+    source_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    is_published: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+    subject: Mapped[Subject] = relationship()
+    topic: Mapped[Topic] = relationship(back_populates="content")
+
+
+class UserTopicProgress(Base):
+    __tablename__ = "user_topic_progress"
+    __table_args__ = (
+        UniqueConstraint("user_id", "topic_id", name="uq_user_topic_progress_user_topic"),
+        Index("ix_user_topic_progress_topic", "topic_id"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id", ondelete="CASCADE"), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)

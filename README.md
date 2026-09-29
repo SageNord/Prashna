@@ -1,6 +1,6 @@
 # Prashna
 
-**Know what's happening. Know why it matters.** A mobile-first current-affairs learning app for UPSC aspirants. Prashna uses Supabase Auth for accounts, FastAPI for authenticated APIs, and PostgreSQL for persistent user data. The live feed ingests official publisher RSS/Atom items, screens them for UPSC relevance, deduplicates related reports, and generates structured study notes during ingestion. Seed content is labeled as sample data and is excluded from the live feed.
+**Know what to study. Understand it. Recall it. Revise it.** Prashna is a mobile-first UPSC learning platform, with current affairs as one learning module. It uses Supabase Auth for accounts, FastAPI for authenticated APIs, and PostgreSQL for persistent user data. The live current-affairs feed continues to ingest official publisher RSS/Atom items, screen them for UPSC relevance, deduplicate related reports, and generate structured study notes during ingestion. The subject/topic catalog and representative demo lessons are seeded by Alembic; demo learning material is labeled and is not official UPSC content.
 
 ## Local setup
 
@@ -111,6 +111,8 @@ Create a Gemini API key and add it only to Render as `GEMINI_API_KEY`. The brows
 - `src/`: React + TypeScript + Vite UI, Supabase Auth client, authenticated API helper.
 - `backend/app/`: FastAPI, JWT validation against Supabase JWKS, SQLAlchemy data access, Gemini/mock ingestion providers.
 - `backend/migrations/`: Alembic schema migrations, including PostgreSQL RLS policies on profile and user-owned data tables.
+- `subjects`, hierarchical `topics`, and `learning_content` form the extensible study catalog. `user_topic_progress` stores completion against the verified Supabase profile ID. The learning catalog is separate from the current-affairs `articles` ingestion model; this preserves the existing pipeline while allowing future article-to-subject mappings.
+- Initial authenticated learning APIs: `GET /api/subjects`, `GET /api/subjects/{slug}`, `GET /api/topics/{slug}`, and `POST /api/topics/{slug}/complete`. Subject/topic responses include progress for the authenticated user only; the API never accepts a user ID from the client.
 - `profiles.id` comes from the verified Supabase token; endpoints do not accept a client-supplied user ID. Bookmarks, quiz history, revisions, activity and statistics are scoped to that identity.
 - Streak dates use the timezone sent by the browser. Activity has unique user/type/date constraints and daily quiz completion is unique per user/day.
 - Public client credentials are limited to the Supabase publishable/anon key. Database, Gemini and JWT secrets stay on the backend.

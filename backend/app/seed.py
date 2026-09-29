@@ -1,7 +1,6 @@
 from datetime import datetime, timezone
-from .database import Base,engine,SessionLocal
+from .database import SessionLocal
 from .models import Article,ArticleTopic,ArticleGSTag,KeyFact,QuizQuestion,QuizOption
-Base.metadata.create_all(bind=engine)
 from . import _seeddata
 def seed():
     db=SessionLocal()

@@ -14,9 +14,10 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from .auth import AuthUser, current_user, require_admin
-from .database import Base, engine, get_db, SessionLocal
+from .database import get_db, SessionLocal
 from .models import (Article, ArticleGSTag, ArticleSource, ArticleTopic, DailyQuizAttempt, IngestionRun, KeyFact, Profile,
-    QuizOption, QuizQuestion, UserActivity, UserBookmark, UserQuizAttempt, UserRevision)
+    LearningContent, QuizOption, QuizQuestion, Subject, Topic, UserActivity, UserBookmark, UserQuizAttempt,
+    UserRevision, UserTopicProgress)
 from .schemas import ArticleIn, AttemptIn, IngestIn, ProfileUpdate, RevisionIn
 from .services.ingestion import process_stored_article, run_ingestion
 from .services.relevance import classify_relevance, event_fingerprint, utc_naive
@@ -24,7 +25,6 @@ from .services.sources import canonicalize_url, configured_sources
 from .services.streaks import streak_metrics
 
 logger = logging.getLogger("prashna.api")
-Base.metadata.create_all(bind=engine)
 app=FastAPI(title="Prashna API",version="2.0.0")
 cors_origins=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:5173,http://127.0.0.1:5173").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware,allow_origins=cors_origins,allow_methods=["GET","POST","PATCH","DELETE","OPTIONS"],allow_headers=["Authorization","Content-Type","X-User-Timezone","X-Cron-Secret"],max_age=600)
@@ -93,6 +93,91 @@ def article_query(db:Session):
 
 @app.get("/api/health")
 def health():return {"status":"ok"}
+
+
+def learning_content_json(row: LearningContent) -> dict:
+    return {"id": row.id, "title": row.title, "slug": row.slug, "content_type": row.content_type,
+        "summary": row.summary, "body": row.body, "difficulty": row.difficulty,
+        "estimated_minutes": row.estimated_minutes, "source": row.source, "source_url": row.source_url}
+
+
+def subject_json(db: Session, subject: Subject, user_id: str) -> dict:
+    topic_ids = db.query(Topic.id).filter(Topic.subject_id == subject.id, Topic.is_active.is_(True)).all()
+    ids = [row[0] for row in topic_ids]
+    completed = (db.query(UserTopicProgress.topic_id).filter(
+        UserTopicProgress.user_id == user_id, UserTopicProgress.topic_id.in_(ids),
+        UserTopicProgress.completed_at.is_not(None)).all() if ids else [])
+    completed_ids = {row[0] for row in completed}
+    total, done = len(ids), len(completed_ids)
+    return {"id": subject.id, "name": subject.name, "slug": subject.slug,
+        "description": subject.description, "icon": subject.icon, "color": subject.color,
+        "display_order": subject.display_order, "topic_count": total, "completed_topics": done,
+        "progress_percent": round(done * 100 / total) if total else 0}
+
+
+@app.get("/api/subjects")
+def list_subjects(db: Session = Depends(get_db), user: AuthUser = Depends(current_user)):
+    subjects = db.query(Subject).filter(Subject.is_active.is_(True)).order_by(Subject.display_order, Subject.name).all()
+    return [subject_json(db, subject, user.id) for subject in subjects]
+
+
+@app.get("/api/subjects/{slug}")
+def get_subject(slug: str, db: Session = Depends(get_db), user: AuthUser = Depends(current_user)):
+    subject = db.query(Subject).filter(Subject.slug == slug, Subject.is_active.is_(True)).first()
+    if subject is None:
+        raise HTTPException(404, "Subject not found")
+    result = subject_json(db, subject, user.id)
+    topics = db.query(Topic).filter(Topic.subject_id == subject.id, Topic.is_active.is_(True)).order_by(Topic.display_order, Topic.name).all()
+    progress_rows = db.query(UserTopicProgress.topic_id, UserTopicProgress.completed_at).filter(
+        UserTopicProgress.user_id == user.id, UserTopicProgress.topic_id.in_([topic.id for topic in topics])
+    ).all() if topics else []
+    progress_by_topic = {topic_id: completed_at for topic_id, completed_at in progress_rows}
+    result["topics"] = [{"id": topic.id, "name": topic.name, "slug": topic.slug,
+        "description": topic.description, "parent_topic_id": topic.parent_topic_id,
+        "display_order": topic.display_order, "completed": progress_by_topic.get(topic.id) is not None,
+        "completed_at": progress_by_topic.get(topic.id)} for topic in topics]
+    return result
+
+
+@app.get("/api/topics/{slug}")
+def get_topic(slug: str, db: Session = Depends(get_db), user: AuthUser = Depends(current_user)):
+    topic = db.query(Topic).filter(Topic.slug == slug, Topic.is_active.is_(True)).first()
+    if topic is None:
+        raise HTTPException(404, "Topic not found")
+    progress = db.query(UserTopicProgress).filter_by(user_id=user.id, topic_id=topic.id).first()
+    content_rows = db.query(LearningContent).filter(LearningContent.topic_id == topic.id,
+        LearningContent.is_published.is_(True)).order_by(LearningContent.id).all()
+    children = db.query(Topic).filter(Topic.parent_topic_id == topic.id, Topic.is_active.is_(True)).order_by(Topic.display_order).all()
+    return {"id": topic.id, "name": topic.name, "slug": topic.slug, "description": topic.description,
+        "parent_topic_id": topic.parent_topic_id,
+        "subject": {"id": topic.subject.id, "name": topic.subject.name, "slug": topic.subject.slug},
+        "completed": bool(progress and progress.completed_at),
+        "children": [{"id": child.id, "name": child.name, "slug": child.slug, "description": child.description} for child in children],
+        "content": [learning_content_json(row) for row in content_rows]}
+
+
+@app.post("/api/topics/{slug}/complete")
+def complete_topic(slug: str, db: Session = Depends(get_db), user: AuthUser = Depends(current_user),
+                   timezone_name: str | None = Header(default=None, alias="X-User-Timezone")):
+    topic = db.query(Topic).filter(Topic.slug == slug, Topic.is_active.is_(True)).first()
+    if topic is None:
+        raise HTTPException(404, "Topic not found")
+    ensure_profile(db, user)
+    progress = db.query(UserTopicProgress).filter_by(user_id=user.id, topic_id=topic.id).first()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    newly_completed = False
+    if progress is None:
+        progress = UserTopicProgress(user_id=user.id, topic_id=topic.id, completed_at=now, updated_at=now)
+        db.add(progress)
+        newly_completed = True
+    elif progress.completed_at is None:
+        progress.completed_at = now
+        progress.updated_at = now
+        newly_completed = True
+    if newly_completed:
+        record_activity(db, user, "TOPIC_COMPLETE", local_today(timezone_name))
+    db.commit()
+    return {"topic_slug": topic.slug, "completed": True, "completed_at": progress.completed_at}
 
 @app.get("/api/feed")
 def feed(category:str|None=None,limit:int=Query(30,ge=1,le=100),offset:int=Query(0,ge=0,le=10000),db:Session=Depends(get_db)):

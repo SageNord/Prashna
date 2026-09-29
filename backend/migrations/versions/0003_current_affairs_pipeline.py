@@ -24,7 +24,12 @@ def upgrade():
     # On a fresh install the previous create_all-based first revision already
     # creates current metadata. On an existing installation, create only the
     # newly introduced tables before adding the Article reference column.
-    Base.metadata.create_all(bind=bind)
+    # This revision predates the learning catalog. Create only its current-
+    # affairs tables; the catalog is introduced by revision 0004.
+    later_tables = {"subjects", "topics", "learning_content", "user_topic_progress"}
+    Base.metadata.create_all(bind=bind, tables=[
+        table for table in Base.metadata.sorted_tables if table.name not in later_tables
+    ])
     inspector = sa.inspect(bind)
     article_columns = {column["name"]: column for column in inspector.get_columns("articles")}
     additions = [
