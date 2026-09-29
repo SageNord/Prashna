@@ -1,8 +1,9 @@
-from collections import defaultdict, deque
+from collections import defaultdict
 from datetime import date, datetime, timezone, timedelta
+import hmac
 from hashlib import sha256
+import logging
 import os
-from threading import Lock
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
@@ -10,20 +11,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from .auth import AuthUser, current_user, require_admin
-from .database import Base, engine, get_db
-from .models import (Article, ArticleGSTag, ArticleTopic, DailyQuizAttempt, KeyFact, Profile,
+from .database import Base, engine, get_db, SessionLocal
+from .models import (Article, ArticleGSTag, ArticleSource, ArticleTopic, DailyQuizAttempt, IngestionRun, KeyFact, Profile,
     QuizOption, QuizQuestion, UserActivity, UserBookmark, UserQuizAttempt, UserRevision)
 from .schemas import ArticleIn, AttemptIn, IngestIn, ProfileUpdate, RevisionIn
-from .services.llm import MockProvider, get_provider, process_with_retry
+from .services.ingestion import process_stored_article, run_ingestion
+from .services.relevance import classify_relevance, event_fingerprint, utc_naive
+from .services.sources import canonicalize_url, configured_sources
 from .services.streaks import streak_metrics
 
+logger = logging.getLogger("prashna.api")
 Base.metadata.create_all(bind=engine)
 app=FastAPI(title="Prashna API",version="2.0.0")
 cors_origins=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:5173,http://127.0.0.1:5173").split(",") if x.strip()]
-app.add_middleware(CORSMiddleware,allow_origins=cors_origins,allow_methods=["GET","POST","PATCH","DELETE","OPTIONS"],allow_headers=["Authorization","Content-Type","X-User-Timezone"],max_age=600)
+app.add_middleware(CORSMiddleware,allow_origins=cors_origins,allow_methods=["GET","POST","PATCH","DELETE","OPTIONS"],allow_headers=["Authorization","Content-Type","X-User-Timezone","X-Cron-Secret"],max_age=600)
 
 def local_today(tz_name:str|None)->date:
     try:tz=ZoneInfo(tz_name or "UTC")
@@ -65,25 +69,39 @@ def record_activity(db:Session,user:AuthUser,activity_type:str,today:date,metada
     profile.updated_at=datetime.now(timezone.utc)
 
 def article_json(article:Article)->dict:
-    return {"id":article.id,"title":article.title,"source":article.source,"source_url":article.source_url,
-        "published_at":article.published_at,"category":article.category,"summary":article.summary,
-        "why_it_matters":article.why_it_matters,"upsc_relevance":article.upsc_relevance,
+    published=article.published_at
+    if published and published.tzinfo is None:published=published.replace(tzinfo=timezone.utc)
+    ingested=article.ingested_at
+    if ingested and ingested.tzinfo is None:ingested=ingested.replace(tzinfo=timezone.utc)
+    processed=article.processed_at
+    if processed and processed.tzinfo is None:processed=processed.replace(tzinfo=timezone.utc)
+    return {"id":article.id,"title":article.title,"original_title":article.original_title or article.title,
+        "source":article.source,"source_url":article.source_url,"source_identifier":article.source_identifier,
+        "published_at":published,"ingested_at":ingested,"category":article.category,"summary":article.summary,
+        "what_happened":article.what_happened or article.summary,"why_it_matters":article.why_it_matters,
+        "background":article.background or "","upsc_relevance":article.upsc_relevance,
         "topics":[row.topic for row in article.topics],"gs_papers":[row.gs_paper for row in article.gs_tags],
         "key_facts":[row.fact for row in article.facts],"prelims_points":article.prelims_points or [],
-        "mains_angles":article.mains_angles or [],"processing_status":article.processing_status,
-        "processing_model":article.processing_model,"processed_at":article.processed_at}
+        "mains_angles":article.mains_angles or [],"important_terms":article.important_terms or [],
+        "relevance_score":article.relevance_score,"relevance_category":article.relevance_category,
+        "alternative_sources":[{"source":row.source_name,"source_url":row.source_url,"published_at":row.published_at}
+                               for row in article.alternative_sources],
+        "processing_status":article.processing_status,"processing_model":article.processing_model,"processed_at":processed}
 
 def article_query(db:Session):
-    return db.query(Article).options(joinedload(Article.topics),joinedload(Article.gs_tags),joinedload(Article.facts))
+    return db.query(Article).options(joinedload(Article.topics),joinedload(Article.gs_tags),joinedload(Article.facts),selectinload(Article.alternative_sources))
 
 @app.get("/api/health")
 def health():return {"status":"ok"}
 
 @app.get("/api/feed")
-def feed(category:str|None=None,limit:int=Query(30,ge=1,le=100),db:Session=Depends(get_db)):
+def feed(category:str|None=None,limit:int=Query(30,ge=1,le=100),offset:int=Query(0,ge=0,le=10000),db:Session=Depends(get_db)):
     query=article_query(db)
+    freshness_cutoff=datetime.now(timezone.utc).replace(tzinfo=None)-timedelta(days=60)
+    query=query.filter(Article.processing_status=="COMPLETED",Article.relevance_category.in_(["HIGH","MEDIUM"]),Article.source_url.is_not(None))
+    query=query.filter(or_(Article.published_at>=freshness_cutoff,Article.published_at.is_(None)))
     if category:query=query.filter(func.lower(Article.category)==category.lower())
-    return [article_json(a) for a in query.order_by(Article.published_at.desc()).limit(limit).all()]
+    return [article_json(a) for a in query.order_by(Article.published_at.desc().nullslast(),Article.relevance_score.desc(),Article.id.desc()).offset(offset).limit(limit).all()]
 
 @app.get("/api/articles/{article_id}")
 def get_article(article_id:int,db:Session=Depends(get_db)):
@@ -227,56 +245,62 @@ def update_profile(data:ProfileUpdate,db:Session=Depends(get_db),user:AuthUser=D
     profile.target_year=data.target_year;profile.preferred_subjects=data.preferred_subjects;profile.onboarding_complete=True
     profile.updated_at=datetime.now(timezone.utc);db.commit();return get_profile_stats(db,user)
 
+def require_cron_secret(secret: str | None = Header(default=None, alias="X-Cron-Secret")) -> None:
+    expected = os.getenv("CRON_SECRET", "")
+    if not expected:
+        raise HTTPException(503, "Scheduled ingestion is not configured")
+    if not secret or not hmac.compare_digest(secret, expected):
+        raise HTTPException(401, "Invalid scheduler credential")
+
+def ingestion_run_json(run: IngestionRun) -> dict:
+    return {"id": run.id, "status": run.status, "triggered_by": run.triggered_by,
+            "started_at": run.started_at, "finished_at": run.finished_at, "duration_ms": run.duration_ms,
+            "sources_configured": run.sources_configured, "sources_succeeded": run.sources_succeeded,
+            "candidates": run.candidates, "ignored": run.ignored, "deduplicated": run.deduplicated,
+            "processed": run.processed, "failed": run.failed, "queued": run.queued, "errors": run.errors or []}
+
+@app.post("/api/ingest/run", status_code=202)
+def start_ingestion(background: BackgroundTasks, db: Session = Depends(get_db), _: None = Depends(require_cron_secret)):
+    active = db.query(IngestionRun).filter(IngestionRun.status.in_(["PENDING", "PROCESSING"])).first()
+    if active:
+        return {"id": active.id, "status": active.status, "already_running": True}
+    run = IngestionRun(status="PENDING", triggered_by="github-actions")
+    db.add(run); db.commit(); db.refresh(run)
+    background.add_task(run_ingestion, run.id)
+    return {"id": run.id, "status": run.status, "already_running": False}
+
+@app.get("/api/ingest/runs/{run_id}")
+def get_ingestion_run(run_id: int, db: Session = Depends(get_db), _: None = Depends(require_cron_secret)):
+    run = db.get(IngestionRun, run_id)
+    if not run: raise HTTPException(404, "Ingestion run not found")
+    return ingestion_run_json(run)
+
 @app.post("/api/ingest",status_code=202)
 def ingest(data:IngestIn,background:BackgroundTasks,db:Session=Depends(get_db),_:AuthUser=Depends(require_admin)):
-    digest=sha256(data.content.encode()).hexdigest()
-    existing=db.query(Article).filter(or_(Article.content_hash==digest,Article.source_url==str(data.source_url) if data.source_url else False)).first()
+    source_url = canonicalize_url(str(data.source_url)) if data.source_url else None
+    digest = sha256(data.content.encode()).hexdigest()
+    duplicate_conditions = [Article.content_hash == digest]
+    if source_url:
+        duplicate_conditions.extend((Article.canonical_url == source_url, Article.source_url == source_url))
+    existing = db.query(Article).filter(or_(*duplicate_conditions)).first()
     if existing:return {"id":existing.id,"processing_status":existing.processing_status,"duplicate":True}
-    article=Article(title=data.title,source=data.source,source_url=str(data.source_url) if data.source_url else None,published_at=datetime.fromisoformat(data.published_at.replace("Z","+00:00")) if data.published_at else datetime.now(timezone.utc),category="Governance",summary=data.content[:1000],why_it_matters="Editorial processing pending.",upsc_relevance="",processing_status="PENDING",raw_content=data.content,content_hash=digest)
-    db.add(article)
-    try:db.commit()
-    except Exception:
-        db.rollback();existing=db.query(Article).filter_by(content_hash=digest).first()
-        if existing:return {"id":existing.id,"processing_status":existing.processing_status,"duplicate":True}
-        raise
-    db.refresh(article);background.add_task(process_article,article.id)
+    published = datetime.fromisoformat(data.published_at.replace("Z", "+00:00")) if data.published_at else datetime.now(timezone.utc)
+    score, relevance, category = classify_relevance(data.title, data.content)
+    article=Article(title=data.title,original_title=data.title,source=data.source,source_url=source_url,canonical_url=source_url,
+        published_at=utc_naive(published),ingested_at=datetime.now(timezone.utc).replace(tzinfo=None),category=category or "Unclassified",
+        summary=data.content[:6000],what_happened=data.content[:6000],why_it_matters="",upsc_relevance="",processing_status="PENDING",
+        raw_content=data.content[:12000],content_hash=digest,event_fingerprint=event_fingerprint(data.title,published),relevance_score=score,
+        relevance_category=relevance)
+    if relevance == "LOW": article.processing_status = "IGNORED"
+    db.add(article);db.commit();db.refresh(article)
+    if article.processing_status == "PENDING": background.add_task(process_article, article.id)
     return {"id":article.id,"processing_status":article.processing_status,"duplicate":False}
 
-_ingestion_times=deque();_ingestion_lock=Lock()
-def process_article(article_id:int)->None:
-    now=time.monotonic()
-    with _ingestion_lock:
-        while _ingestion_times and now-_ingestion_times[0]>60:_ingestion_times.popleft()
-        if len(_ingestion_times)>=5:
-            db=next(get_db());article=db.get(Article,article_id)
-            if article:article.processing_status="FAILED";article.processing_error="Local ingestion rate limit reached; retry later.";db.commit()
-            db.close();return
-        _ingestion_times.append(now)
-    db=next(get_db())
-    try:
-        article=db.get(Article,article_id)
-        if not article or article.processing_status=="COMPLETED":return
-        article.processing_status="PROCESSING";db.commit()
-        provider=get_provider()
-        try:result=process_with_retry(provider,article.title,article.source,article.raw_content or "")
-        except Exception as error:
-            provider=MockProvider();result=provider.process(article.title,article.source,article.raw_content or "")
-            article.processing_error=str(error)[:1000]
-        article.title=str(result.get("title") or article.title)[:300]
-        article.summary=str(result.get("summary") or article.raw_content or "")
-        article.why_it_matters=str(result.get("why_it_matters") or "")
-        article.upsc_relevance=str(result.get("upsc_relevance") or "")
-        article.prelims_points=result.get("prelims_points") or [];article.mains_angles=result.get("mains_angles") or []
-        article.topics=[ArticleTopic(topic=str(x)[:150]) for x in result.get("topics",[])[:20]]
-        article.gs_tags=[ArticleGSTag(gs_paper=str(x)[:30]) for x in result.get("gs_papers",[])[:8]]
-        article.facts=[KeyFact(fact=str(x)[:2000]) for x in result.get("key_facts",[])[:12]]
-        for item in result.get("quiz_questions",[])[:5]:
-            options=item.get("options",[]);correct_index=item.get("answer_index",0)
-            question=QuizQuestion(article_id=article.id,question=str(item.get("question","")),question_type=str(item.get("question_type","mcq")),explanation=str(item.get("explanation","")))
-            question.options=[QuizOption(option_text=str(opt.get("text",opt)) if isinstance(opt,dict) else str(opt),is_correct=(i==correct_index or (isinstance(opt,dict) and opt.get("is_correct",False)))) for i,opt in enumerate(options)]
-            if question.question and question.options:article.quiz_questions.append(question)
-        article.processing_model=provider.name;article.processed_at=datetime.now(timezone.utc);article.processing_status="COMPLETED";article.raw_content=None;db.commit()
-    except Exception as error:
-        db.rollback();article=db.get(Article,article_id)
-        if article:article.processing_status="FAILED";article.processing_error=str(error)[:1000];db.commit()
-    finally:db.close()
+def process_stored_article_by_id(article_id: int) -> None:
+    with SessionLocal() as db:
+        article = db.get(Article, article_id)
+        if article: process_stored_article(db, article)
+
+def process_article(article_id: int) -> None:
+    """Compatibility entry point for the protected one-off admin ingestion route."""
+    process_stored_article_by_id(article_id)

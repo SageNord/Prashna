@@ -1,6 +1,6 @@
 # Prashna
 
-**Know what's happening. Know why it matters.** A mobile-first current-affairs learning app for UPSC aspirants. Prashna uses Supabase Auth for accounts, FastAPI for authenticated APIs, and PostgreSQL for persistent user data. The existing editorial sample feed remains available as a learning sample; it is not a live news feed.
+**Know what's happening. Know why it matters.** A mobile-first current-affairs learning app for UPSC aspirants. Prashna uses Supabase Auth for accounts, FastAPI for authenticated APIs, and PostgreSQL for persistent user data. The live feed ingests official publisher RSS/Atom items, screens them for UPSC relevance, deduplicates related reports, and generates structured study notes during ingestion. Seed content is labeled as sample data and is excluded from the live feed.
 
 ## Local setup
 
@@ -47,6 +47,8 @@ For a no-cloud UI/API smoke run, leave the Supabase client values blank. The app
 | `CORS_ORIGINS` | Render/backend only | Comma-separated exact frontend origins, including the production Vercel domain |
 | `GEMINI_API_KEY` | Optional, Render/backend only | Gemini key used only during content ingestion |
 | `LLM_PROVIDER` | Render/backend only | `gemini` (default) or `mock` |
+| `CRON_SECRET` | Render/backend and GitHub Actions secret | Shared secret protecting scheduled refresh endpoints; never expose to Vite |
+| `NEWS_RSS_FEEDS` | Optional, Render/backend only | Semicolon-separated `Name|https://feed.xml|priority` source overrides |
 | `ADMIN_USER_IDS` | Render/backend only | Optional comma-separated Supabase UUIDs permitted to ingest content |
 | `SUPABASE_JWT_SECRET` | Optional, backend only | Legacy HS256 JWT verification only; asymmetric JWKS verification is preferred |
 
@@ -70,8 +72,8 @@ The services have separate free-plan limits and terms that can change. Render's 
 2. Select **Root Directory** `backend`, runtime **Python 3**.
 3. Set **Build Command** to `pip install -r requirements.txt`.
 4. Set **Start Command** to `alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT`.
-5. Add backend environment variables in Render: `DATABASE_URL`, `SUPABASE_URL`, `CORS_ORIGINS`, `LLM_PROVIDER=gemini`, and optionally `GEMINI_API_KEY` and `ADMIN_USER_IDS`. Use the deployed Vercel origin in `CORS_ORIGINS` (no trailing slash), for example `https://your-app.vercel.app`. Include localhost origins only if needed for local development.
-6. Deploy. Check `https://YOUR-RENDER-SERVICE.onrender.com/api/health` returns `{"status":"ok"}`. First deploy runs Alembic migrations. Run `python -m app.seed` once from the Render Shell to install the sample articles. The seed command is idempotent and leaves existing articles and user activity untouched.
+5. Add backend environment variables in Render: `DATABASE_URL`, `SUPABASE_URL`, `CORS_ORIGINS`, `CRON_SECRET`, `LLM_PROVIDER=gemini`, and optionally `GEMINI_API_KEY` and `ADMIN_USER_IDS`. Use the deployed Vercel origin in `CORS_ORIGINS` (no trailing slash), for example `https://your-app.vercel.app`. Include localhost origins only if needed for local development.
+6. Deploy. Check `https://YOUR-RENDER-SERVICE.onrender.com/api/health` returns `{"status":"ok"}`. First deploy runs Alembic migrations. Demo seed records are excluded from the live feed; no seed step is required for current affairs. Trigger the GitHub workflow once after configuring its secrets to populate the feed.
 
 Render's free instance can take a little while to wake after inactivity; this is normal for a free service. Uploaded files/local SQLite are not durable there. Use Supabase PostgreSQL and avoid writing persistent app data to the Render filesystem.
 
@@ -87,9 +89,22 @@ Render's free instance can take a little while to wake after inactivity; this is
 
 `vercel.json` includes an SPA rewrite so deep links serve the React app. When a Vercel preview uses a different domain, add that exact preview origin to Render CORS if you want previews to call the API.
 
+### Scheduled current-affairs refresh
+
+Default feeds are the [Press Information Bureau RSS feed](https://www.pib.gov.in/ViewRss.aspx?lang=1&reg=1) and [Reserve Bank of India RSS feeds](https://www.rbi.org.in/Scripts/rss.aspx). They are fetched over HTTPS as RSS/Atom metadata only; Prashna does not crawl publisher article pages. You can replace or extend them with `NEWS_RSS_FEEDS=Name|https://feed.example/rss|90;Other source|https://other.example/feed.xml|70`. Priority is 0–100; higher values are preferred when multiple sources report the same event.
+
+Each feed item is screened with a deterministic UPSC-topic relevance classifier. Low-relevance items are ignored and never shown to learners. Matching canonical URLs, normalized title/date fingerprints, and close title matches within a two-day window are consolidated, with other publisher links preserved as citations. Only screened items go through the AI processor. Article pages distinguish “what happened” from generated context, significance, Prelims points, Mains angles, facts, terms, and questions. If AI is unavailable, a source-only fallback is used.
+
+The repository includes `.github/workflows/daily-ingestion.yml`, which runs daily at 09:00 IST and can also be started using **Actions → Refresh Prashna current affairs → Run workflow**. Configure these GitHub repository Actions secrets:
+
+- `PRASHNA_API_URL`: backend base URL, such as `https://your-service.onrender.com`.
+- `PRASHNA_CRON_SECRET`: the exact same long random value as Render's `CRON_SECRET`.
+
+The workflow calls `POST /api/ingest/run` and polls `GET /api/ingest/runs/{id}` until the run completes. Both endpoints require the `X-Cron-Secret` header. Summaries report source, processed, ignored, duplicate, failed, and queued counts plus sanitized error types. After deployment, start a refresh manually with `workflow_dispatch`. Generate a secret with `python -c "import secrets; print(secrets.token_urlsafe(48))"`; keep it on the backend and in GitHub Actions secrets, never in Vite variables or browser code.
+
 ### Optional Gemini processing
 
-Create a Gemini API key and add it only to Render as `GEMINI_API_KEY`. The browser never calls Gemini. Gemini is used only when an administrator submits source content to `POST /api/ingest`; processed output is stored in PostgreSQL, and the user-facing feed does not call AI. Without a key, ingestion uses a labeled mock processor. Free quotas and model availability vary by account and may change; check Google's live pricing/limits before relying on automated ingestion. Set `LLM_PROVIDER=mock` to force the fallback.
+Create a Gemini API key and add it only to Render as `GEMINI_API_KEY`. The browser never calls Gemini. Gemini runs during scheduled processing of relevant items (or when an administrator submits source content); the learner feed does not call AI. Without a key, ingestion uses a source-only fallback. Free quotas and model availability vary by account; set `LLM_PROVIDER=mock` to force the fallback.
 
 ## Architecture and security
 
@@ -116,4 +131,3 @@ python -m app.seed
 # API documentation while the backend is running
 # http://localhost:8000/docs
 ```
-

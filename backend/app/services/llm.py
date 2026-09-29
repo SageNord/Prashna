@@ -13,7 +13,7 @@ class MockProvider:
     name = "mock"
     def process(self, title: str, source: str, content: str) -> dict:
         excerpt = re.sub(r"\s+", " ", content).strip()[:720]
-        return {"title":title,"summary":excerpt,"why_it_matters":"Review the supplied source for its policy implications, affected groups, implementation challenges and possible trade-offs. This mock analysis avoids adding claims beyond the source.","upsc_relevance":"Editorial processing is unavailable. Treat this as a source excerpt and verify context before using it in an answer.","gs_papers":[],"topics":[],"key_facts":[],"prelims_points":[],"mains_angles":[],"quiz_questions":[]}
+        return {"title":title,"summary":excerpt,"what_happened":excerpt,"why_it_matters":"","background":"","upsc_relevance":"Editorial processing was unavailable; only the publisher's supplied headline and summary are shown.","gs_papers":[],"topics":[],"key_facts":[],"prelims_points":[],"mains_angles":[],"important_terms":[],"quiz_questions":[]}
 
 class GeminiProvider:
     name = "gemini-2.5-flash"
@@ -24,7 +24,7 @@ class GeminiProvider:
         prompt=f"{EDITOR_SYSTEM}\n\nUse only this supplied source. Source name: {source}\nTitle: {title}\n\nSOURCE TEXT:\n{content}\n\nReturn JSON only."
         response=self.client.models.generate_content(model=self.name,contents=prompt,config={"response_mime_type":"application/json"})
         data=json.loads(response.text or "{}")
-        required=("title","summary","why_it_matters","upsc_relevance","gs_papers","topics","key_facts","prelims_points","mains_angles","quiz_questions")
+        required=("title","summary","what_happened","why_it_matters","background","upsc_relevance","gs_papers","topics","key_facts","prelims_points","mains_angles","important_terms","quiz_questions")
         if any(key not in data for key in required):raise ValueError("Gemini response is missing required structured fields")
         return data
 

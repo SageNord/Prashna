@@ -1,0 +1,62 @@
+name: Refresh Prashna current affairs
+
+on:
+  schedule:
+    # 03:30 UTC is 09:00 India Standard Time.
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prashna-feed-refresh
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Start the ingestion run
+        id: start
+        env:
+          API_URL: ${{ secrets.PRASHNA_API_URL }}
+          CRON_SECRET: ${{ secrets.PRASHNA_CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$API_URL" || -z "$CRON_SECRET" ]]; then
+            echo "Set PRASHNA_API_URL and PRASHNA_CRON_SECRET in GitHub Actions secrets."
+            exit 1
+          fi
+          response="$(curl --fail --silent --show-error --retry 5 --retry-all-errors --retry-delay 10 \
+            --connect-timeout 20 --max-time 180 \
+            -X POST "${API_URL%/}/api/ingest/run" \
+            -H "X-Cron-Secret: ${CRON_SECRET}" -H 'Accept: application/json')"
+          echo "$response"
+          run_id="$(echo "$response" | jq -r '.id')"
+          if [[ -z "$run_id" || "$run_id" == "null" ]]; then echo "API did not return a run id"; exit 1; fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for ingestion and report its result
+        env:
+          API_URL: ${{ secrets.PRASHNA_API_URL }}
+          CRON_SECRET: ${{ secrets.PRASHNA_CRON_SECRET }}
+          RUN_ID: ${{ steps.start.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 90); do
+            response="$(curl --fail --silent --show-error --retry 3 --retry-all-errors --retry-delay 5 \
+              --connect-timeout 20 --max-time 90 \
+              "${API_URL%/}/api/ingest/runs/${RUN_ID}" \
+              -H "X-Cron-Secret: ${CRON_SECRET}" -H 'Accept: application/json')"
+            status="$(echo "$response" | jq -r '.status')"
+            if [[ "$status" == "COMPLETED" || "$status" == "PARTIAL" || "$status" == "FAILED" ]]; then
+              echo "$response" | jq '{id,status,sources_configured,sources_succeeded,candidates,ignored,deduplicated,processed,failed,queued,errors}'
+              [[ "$status" != "FAILED" ]]
+              exit $?
+            fi
+            sleep 10
+          done
+          echo "Timed out while waiting for ingestion run ${RUN_ID}" >&2
+          exit 1
