@@ -9,6 +9,14 @@ down_revision = "0002_user_activity"
 branch_labels = None
 depends_on = None
 
+# SQLite reports inline UNIQUE constraints as unnamed, even when the original
+# SQLAlchemy model used ``unique=True``. Batch mode must assign such reflected
+# constraints a deterministic name while it recreates the table.
+SQLITE_BATCH_NAMING = {
+    "uq": "uq_%(table_name)s_%(column_0_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+}
+
 
 def upgrade():
     bind = op.get_bind()
@@ -31,18 +39,19 @@ def upgrade():
         sa.Column("relevance_score", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("relevance_category", sa.String(12), nullable=False, server_default="LOW"),
         sa.Column("event_fingerprint", sa.String(64), nullable=True),
-        sa.Column("ingestion_run_id", sa.Integer(), sa.ForeignKey("ingestion_runs.id"), nullable=True),
+        sa.Column("ingestion_run_id", sa.Integer(), sa.ForeignKey(
+            "ingestion_runs.id", name="fk_articles_ingestion_run_id_ingestion_runs"), nullable=True),
     ]
     missing = [column for column in additions if column.name not in article_columns]
     if missing:
-        with op.batch_alter_table("articles") as batch:
+        with op.batch_alter_table("articles", naming_convention=SQLITE_BATCH_NAMING) as batch:
             for column in missing:
                 batch.add_column(column)
 
     # RSS sources may legitimately omit their publication date. Preserve that
     # uncertainty instead of stamping an invented current timestamp.
     if article_columns.get("published_at", {}).get("nullable") is False:
-        with op.batch_alter_table("articles") as batch:
+        with op.batch_alter_table("articles", naming_convention=SQLITE_BATCH_NAMING) as batch:
             batch.alter_column("published_at", existing_type=sa.DateTime(), nullable=True)
 
     columns = {column["name"] for column in sa.inspect(bind).get_columns("articles")}
@@ -80,7 +89,7 @@ def downgrade():
     remove = ("ingestion_run_id", "event_fingerprint", "relevance_category", "relevance_score", "important_terms", "background", "what_happened", "ingested_at", "source_priority", "canonical_url", "source_identifier", "original_title")
     present = [name for name in remove if name in columns]
     if present:
-        with op.batch_alter_table("articles") as batch:
+        with op.batch_alter_table("articles", naming_convention=SQLITE_BATCH_NAMING) as batch:
             for name in present:
                 batch.drop_column(name)
     for table in ("article_sources", "ingestion_runs"):

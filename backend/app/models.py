@@ -10,15 +10,23 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 class Article(Base):
     __tablename__ = "articles"
+    __table_args__ = (
+        UniqueConstraint("content_hash", name="uq_articles_content_hash"),
+        UniqueConstraint("canonical_url", name="uq_articles_canonical_url"),
+        UniqueConstraint("event_fingerprint", name="uq_articles_event_fingerprint"),
+        Index("ix_articles_published_at", "published_at"),
+        Index("ix_articles_relevance_category", "relevance_category"),
+        Index("ix_articles_ingestion_run_id", "ingestion_run_id"),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     title: Mapped[str] = mapped_column(String(300))
     source: Mapped[str] = mapped_column(String(200), default="Prashna Editorial Learning Sample")
     source_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
-    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     original_title: Mapped[str | None] = mapped_column(String(300), nullable=True)
     source_identifier: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     source_priority: Mapped[int] = mapped_column(Integer, default=50, nullable=False)
-    canonical_url: Mapped[str | None] = mapped_column(String(2048), unique=True, nullable=True)
+    canonical_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     ingested_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     category: Mapped[str] = mapped_column(String(80))
     summary: Mapped[str] = mapped_column(Text)
@@ -30,15 +38,18 @@ class Article(Base):
     mains_angles: Mapped[list] = mapped_column(JSON, default=list)
     important_terms: Mapped[list] = mapped_column(JSON, default=list)
     relevance_score: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    relevance_category: Mapped[str] = mapped_column(String(12), default="LOW", nullable=False, index=True)
-    event_fingerprint: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
-    ingestion_run_id: Mapped[int | None] = mapped_column(ForeignKey("ingestion_runs.id"), nullable=True, index=True)
+    relevance_category: Mapped[str] = mapped_column(String(12), default="LOW", nullable=False)
+    event_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ingestion_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ingestion_runs.id", name="fk_articles_ingestion_run_id_ingestion_runs"),
+        nullable=True,
+    )
     processing_status: Mapped[str] = mapped_column(String(20), default="COMPLETED", index=True)
     processing_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     processing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     raw_content: Mapped[str | None] = mapped_column(Text, nullable=True)
-    content_hash: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     topics: Mapped[list["ArticleTopic"]] = relationship(cascade="all, delete-orphan")
     gs_tags: Mapped[list["ArticleGSTag"]] = relationship(cascade="all, delete-orphan")
     facts: Mapped[list["KeyFact"]] = relationship(cascade="all, delete-orphan")
@@ -48,12 +59,17 @@ class Article(Base):
 class ArticleSource(Base):
     """Additional primary/authoritative sources consolidated under one event."""
     __tablename__ = "article_sources"
-    __table_args__ = (UniqueConstraint("article_id", "canonical_url", name="uq_article_source_url"), Index("ix_article_sources_article", "article_id"))
+    __table_args__ = (
+        UniqueConstraint("article_id", "canonical_url", name="uq_article_source_url"),
+        UniqueConstraint("source_url", name="uq_article_sources_source_url"),
+        UniqueConstraint("canonical_url", name="uq_article_sources_canonical_url"),
+        Index("ix_article_sources_article", "article_id"),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     article_id: Mapped[int] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"), nullable=False)
     source_name: Mapped[str] = mapped_column(String(200), nullable=False)
-    source_url: Mapped[str] = mapped_column(String(2048), nullable=False, unique=True)
-    canonical_url: Mapped[str] = mapped_column(String(2048), nullable=False, unique=True)
+    source_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    canonical_url: Mapped[str] = mapped_column(String(2048), nullable=False)
     source_identifier: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     source_priority: Mapped[int] = mapped_column(Integer, default=50, nullable=False)
@@ -61,8 +77,9 @@ class ArticleSource(Base):
 
 class IngestionRun(Base):
     __tablename__ = "ingestion_runs"
+    __table_args__ = (Index("ix_ingestion_runs_status", "status"),)
     id: Mapped[int] = mapped_column(primary_key=True)
-    status: Mapped[str] = mapped_column(String(20), default="PENDING", index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING", nullable=False)
     triggered_by: Mapped[str] = mapped_column(String(40), default="scheduled", nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
