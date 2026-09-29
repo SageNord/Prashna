@@ -15,7 +15,8 @@ def upgrade():
     # Keep this historical revision frozen as the original schema. Models may
     # grow in later revisions; those tables must be created by their own
     # migration rather than appearing before Alembic reaches that revision.
-    later_tables = {"subjects", "topics", "learning_content", "user_topic_progress"}
+    later_tables = {"subjects", "topics", "learning_content", "user_topic_progress",
+                    "questions", "question_options", "user_question_attempts"}
     Base.metadata.create_all(bind=op.get_bind(), tables=[
         table for table in Base.metadata.sorted_tables if table.name not in later_tables
     ])

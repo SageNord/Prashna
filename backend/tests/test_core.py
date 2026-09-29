@@ -11,9 +11,9 @@ from app.auth import AuthUser, current_user
 from app.database import Base, get_db
 import app.main as api_module
 from app.main import app, require_admin
-from app.models import (Article, ArticleTopic, DailyQuizAttempt, LearningContent, Profile, QuizOption,
-                        QuizQuestion, Subject, Topic, UserActivity, UserBookmark, UserRevision,
-                        UserTopicProgress)
+from app.models import (Article, ArticleTopic, DailyQuizAttempt, LearningContent, Profile, Question,
+                        QuestionOption, QuizOption, QuizQuestion, Subject, Topic, UserActivity,
+                        UserBookmark, UserQuestionAttempt, UserRevision, UserTopicProgress)
 from app.services.llm import MockProvider, get_provider, transform_source
 from app.services.streaks import streak_metrics
 
@@ -69,6 +69,7 @@ def test_health_and_public_feed(harness):
 def test_auth_required_without_bearer():
     response = TestClient(app).get("/api/bookmarks")
     assert response.status_code == 401
+    assert TestClient(app).get("/api/topics/private-topic/questions").status_code == 401
 
 
 def test_bookmark_idempotency_and_user_isolation(harness):
@@ -193,6 +194,112 @@ def test_learning_catalog_and_user_scoped_topic_progress(harness):
     db = factory(); db.add(Profile(id=other_id, email="other@example.com")); db.commit(); db.close()
     app.dependency_overrides[current_user] = lambda: AuthUser(other_id, "other@example.com", {}, {})
     assert client.get("/api/subjects").json()[0]["progress_percent"] == 0
+
+
+def add_practice_question(db, *, slug="practice-topic", question_text="Which option is correct?", published=True):
+    subject = db.query(Subject).filter_by(slug="practice-subject").first()
+    if subject is None:
+        subject = Subject(name="Practice Subject", slug="practice-subject", description="Demo subject.",
+                          icon="book-open", color="#416c52", display_order=1, is_active=True)
+        db.add(subject); db.flush()
+    topic = db.query(Topic).filter_by(slug=slug).first()
+    if topic is None:
+        topic = Topic(subject_id=subject.id, name="Practice Topic", slug=slug, description="Demo topic.",
+                      display_order=1, is_active=True)
+        db.add(topic); db.flush()
+    question = Question(topic_id=topic.id, question_text=question_text,
+        explanation="The first option is supported by the explanation.", difficulty="MEDIUM",
+        question_type="MCQ", source="Prashna demo questions", is_published=published)
+    question.options = [QuestionOption(option_text="Correct answer", is_correct=True, display_order=0),
+                        QuestionOption(option_text="Incorrect answer", is_correct=False, display_order=1)]
+    db.add(question); db.flush()
+    return topic, question, question.options[0], question.options[1]
+
+
+def test_question_listing_hides_answer_and_excludes_unpublished(harness):
+    client, factory, _, _, _, _ = harness
+    db = factory()
+    topic, question, correct_option, _ = add_practice_question(db)
+    add_practice_question(db, slug="practice-topic", question_text="Unpublished sample?", published=False)
+    db.commit()
+
+    response = client.get(f"/api/topics/{topic.slug}/questions")
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+    item = response.json()[0]
+    assert item["id"] == question.id
+    assert item["question_type"] == "MCQ"
+    assert item["source"] == "Prashna demo questions"
+    assert all(set(option) == {"id", "text"} for option in item["options"])
+    assert "correct_option_id" not in item
+    assert all("is_correct" not in option for option in item["options"])
+    assert correct_option.id in [option["id"] for option in item["options"]]
+
+
+def test_question_attempt_correct_incorrect_and_persists_user_identity(harness):
+    client, factory, user, _, _, _ = harness
+    db = factory()
+    _, correct_q, correct_option, wrong_option = add_practice_question(db, slug="correct-topic")
+    _, wrong_q, wrong_q_correct, wrong_q_wrong_option = add_practice_question(db, slug="wrong-topic", question_text="Second practice question?")
+    db.commit()
+
+    correct = client.post(f"/api/questions/{correct_q.id}/attempt", json={"option_id": correct_option.id,
+        "user_id": str(uuid4())})
+    assert correct.status_code == 200
+    assert correct.json()["is_correct"] is True
+    assert correct.json()["correct_option_id"] == correct_option.id
+    assert correct.json()["correct_answer"] == "Correct answer"
+    assert correct.json()["explanation"] == correct_q.explanation
+
+    incorrect = client.post(f"/api/questions/{wrong_q.id}/attempt", json={"option_id": wrong_q_wrong_option.id})
+    assert incorrect.status_code == 200
+    assert incorrect.json()["is_correct"] is False
+    assert incorrect.json()["correct_option_id"] == wrong_q_correct.id
+    assert incorrect.json()["correct_answer"] == "Correct answer"
+
+    db = factory()
+    saved = db.query(UserQuestionAttempt).order_by(UserQuestionAttempt.id).all()
+    assert len(saved) == 2
+    assert all(row.user_id == user.id for row in saved)
+    assert [row.is_correct for row in saved] == [True, False]
+    assert db.query(UserActivity).filter_by(user_id=user.id, activity_type="QUESTION_ATTEMPT").count() == 1
+    assert client.get("/api/me/question-attempts?topic_slug=wrong-topic").json()[0]["selected_answer"] == "Incorrect answer"
+    db.close()
+
+
+def test_question_attempt_rejects_invalid_or_foreign_options(harness):
+    client, factory, _, _, _, _ = harness
+    db = factory()
+    _, question, _, _ = add_practice_question(db, slug="first-topic")
+    _, other_question, other_option, _ = add_practice_question(db, slug="second-topic", question_text="Another question?")
+    db.commit()
+    assert other_question.id != question.id
+    assert client.post(f"/api/questions/{question.id}/attempt", json={"option_id": 999999}).status_code == 422
+    assert client.post(f"/api/questions/{question.id}/attempt", json={"option_id": other_option.id}).status_code == 422
+
+
+def test_unpublished_question_cannot_be_retrieved_or_attempted(harness):
+    client, factory, _, _, _, _ = harness
+    db = factory()
+    topic, question, option, _ = add_practice_question(db, slug="unpublished-topic", published=False)
+    db.commit()
+    assert client.get(f"/api/topics/{topic.slug}/questions").json() == []
+    assert client.post(f"/api/questions/{question.id}/attempt", json={"option_id": option.id}).status_code == 404
+
+
+def test_question_attempt_history_is_scoped_to_authenticated_user(harness):
+    client, factory, _, _, _, _ = harness
+    db = factory()
+    _, question, _, wrong_option = add_practice_question(db)
+    db.commit()
+    assert client.post(f"/api/questions/{question.id}/attempt", json={"option_id": wrong_option.id}).status_code == 200
+    assert len(client.get("/api/me/question-attempts").json()) == 1
+
+    other_id = str(uuid4())
+    db = factory(); db.add(Profile(id=other_id, email="other@example.com")); db.commit(); db.close()
+    app.dependency_overrides[current_user] = lambda: AuthUser(other_id, "other@example.com", {}, {})
+    assert client.get("/api/me/question-attempts").json() == []
+    assert client.get(f"/api/me/question-attempts?user_id={harness[2].id}").json() == []
 
 
 def test_admin_ingestion_deduplicates_identical_source(harness, monkeypatch):

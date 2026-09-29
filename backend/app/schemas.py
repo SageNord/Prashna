@@ -23,6 +23,9 @@ class AttemptIn(BaseModel):
     question_id: int = Field(gt=0)
     selected_option: int = Field(gt=0)
 
+class QuestionAttemptIn(BaseModel):
+    option_id: int = Field(gt=0)
+
 class RevisionIn(BaseModel):
     difficulty: str = Field(pattern="^(easy|good|difficult)$")
 

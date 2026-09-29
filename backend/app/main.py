@@ -16,9 +16,9 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 from .auth import AuthUser, current_user, require_admin
 from .database import get_db, SessionLocal
 from .models import (Article, ArticleGSTag, ArticleSource, ArticleTopic, DailyQuizAttempt, IngestionRun, KeyFact, Profile,
-    LearningContent, QuizOption, QuizQuestion, Subject, Topic, UserActivity, UserBookmark, UserQuizAttempt,
-    UserRevision, UserTopicProgress)
-from .schemas import ArticleIn, AttemptIn, IngestIn, ProfileUpdate, RevisionIn
+    LearningContent, Question, QuestionOption, QuizOption, QuizQuestion, Subject, Topic, UserActivity,
+    UserBookmark, UserQuestionAttempt, UserQuizAttempt, UserRevision, UserTopicProgress)
+from .schemas import ArticleIn, AttemptIn, IngestIn, ProfileUpdate, QuestionAttemptIn, RevisionIn
 from .services.ingestion import process_stored_article, run_ingestion
 from .services.relevance import classify_relevance, event_fingerprint, utc_naive
 from .services.sources import canonicalize_url, configured_sources
@@ -147,13 +147,15 @@ def get_topic(slug: str, db: Session = Depends(get_db), user: AuthUser = Depends
     progress = db.query(UserTopicProgress).filter_by(user_id=user.id, topic_id=topic.id).first()
     content_rows = db.query(LearningContent).filter(LearningContent.topic_id == topic.id,
         LearningContent.is_published.is_(True)).order_by(LearningContent.id).all()
+    question_count = db.query(Question.id).filter(Question.topic_id == topic.id,
+        Question.is_published.is_(True), Question.question_type == "MCQ").count()
     children = db.query(Topic).filter(Topic.parent_topic_id == topic.id, Topic.is_active.is_(True)).order_by(Topic.display_order).all()
     return {"id": topic.id, "name": topic.name, "slug": topic.slug, "description": topic.description,
         "parent_topic_id": topic.parent_topic_id,
         "subject": {"id": topic.subject.id, "name": topic.subject.name, "slug": topic.subject.slug},
         "completed": bool(progress and progress.completed_at),
         "children": [{"id": child.id, "name": child.name, "slug": child.slug, "description": child.description} for child in children],
-        "content": [learning_content_json(row) for row in content_rows]}
+        "content": [learning_content_json(row) for row in content_rows], "question_count": question_count}
 
 
 @app.post("/api/topics/{slug}/complete")
@@ -178,6 +180,79 @@ def complete_topic(slug: str, db: Session = Depends(get_db), user: AuthUser = De
         record_activity(db, user, "TOPIC_COMPLETE", local_today(timezone_name))
     db.commit()
     return {"topic_slug": topic.slug, "completed": True, "completed_at": progress.completed_at}
+
+
+def question_public_json(question: Question) -> dict:
+    return {"id": question.id, "question_text": question.question_text,
+        "difficulty": question.difficulty, "question_type": question.question_type,
+        "source": question.source,
+        "options": [{"id": option.id, "text": option.option_text} for option in question.options]}
+
+
+@app.get("/api/topics/{slug}/questions")
+def topic_questions(slug: str, db: Session = Depends(get_db), user: AuthUser = Depends(current_user)):
+    topic = db.query(Topic).filter(Topic.slug == slug, Topic.is_active.is_(True)).first()
+    if topic is None:
+        raise HTTPException(404, "Topic not found")
+    questions = db.query(Question).options(selectinload(Question.options)).filter(
+        Question.topic_id == topic.id, Question.is_published.is_(True), Question.question_type == "MCQ"
+    ).order_by(Question.id).all()
+    return [question_public_json(question) for question in questions]
+
+
+@app.post("/api/questions/{question_id}/attempt")
+def submit_question_attempt(question_id: int, data: QuestionAttemptIn, db: Session = Depends(get_db),
+                            user: AuthUser = Depends(current_user),
+                            timezone_name: str | None = Header(default=None, alias="X-User-Timezone")):
+    question = db.query(Question).options(selectinload(Question.options)).filter(
+        Question.id == question_id, Question.is_published.is_(True), Question.question_type == "MCQ"
+    ).first()
+    if question is None:
+        raise HTTPException(404, "Question not found")
+    selected = next((option for option in question.options if option.id == data.option_id), None)
+    if selected is None:
+        raise HTTPException(422, "Selected option does not belong to this question")
+    correct_options = [option for option in question.options if option.is_correct]
+    if len(correct_options) != 1:
+        logger.error("Published MCQ has invalid answer key question_id=%s", question_id)
+        raise HTTPException(500, "Question answer key is unavailable")
+    correct = correct_options[0]
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    attempt = UserQuestionAttempt(user_id=user.id, question_id=question.id,
+        selected_option_id=selected.id, is_correct=(selected.id == correct.id), attempted_at=now)
+    ensure_profile(db, user)
+    db.add(attempt)
+    record_activity(db, user, "QUESTION_ATTEMPT", local_today(timezone_name))
+    db.commit()
+    db.refresh(attempt)
+    return {"attempt_id": attempt.id, "is_correct": attempt.is_correct,
+        "selected_option_id": selected.id, "selected_answer": selected.option_text,
+        "correct_option_id": correct.id, "correct_answer": correct.option_text,
+        "explanation": question.explanation}
+
+
+@app.get("/api/me/question-attempts")
+def question_attempt_history(topic_slug: str | None = None,
+                             limit: int = Query(100, ge=1, le=100),
+                             db: Session = Depends(get_db), user: AuthUser = Depends(current_user)):
+    query = db.query(UserQuestionAttempt).join(Question).options(
+        joinedload(UserQuestionAttempt.question).selectinload(Question.options),
+        joinedload(UserQuestionAttempt.selected_option)
+    ).filter(UserQuestionAttempt.user_id == user.id)
+    if topic_slug:
+        query = query.join(Topic, Question.topic_id == Topic.id).filter(Topic.slug == topic_slug)
+    attempts = query.order_by(UserQuestionAttempt.attempted_at.desc(), UserQuestionAttempt.id.desc()).limit(limit).all()
+    result = []
+    for attempt in attempts:
+        correct = next((option for option in attempt.question.options if option.is_correct), None)
+        result.append({"id": attempt.id, "question_id": attempt.question_id,
+            "question_text": attempt.question.question_text, "selected_option_id": attempt.selected_option_id,
+            "selected_answer": attempt.selected_option.option_text,
+            "correct_option_id": correct.id if correct else None,
+            "correct_answer": correct.option_text if correct else None,
+            "is_correct": attempt.is_correct, "explanation": attempt.question.explanation,
+            "attempted_at": attempt.attempted_at})
+    return result
 
 @app.get("/api/feed")
 def feed(category:str|None=None,limit:int=Query(30,ge=1,le=100),offset:int=Query(0,ge=0,le=10000),db:Session=Depends(get_db)):

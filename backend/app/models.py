@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import String, Text, DateTime, ForeignKey, Boolean, Integer, Date, JSON, UniqueConstraint, Index, Uuid
+from sqlalchemy import String, Text, DateTime, ForeignKey, Boolean, Integer, Date, JSON, UniqueConstraint, Index, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .database import Base
 
@@ -288,3 +288,58 @@ class UserTopicProgress(Base):
     topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id", ondelete="CASCADE"), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class Question(Base):
+    __tablename__ = "questions"
+    __table_args__ = (
+        Index("ix_questions_topic_published", "topic_id", "is_published"),
+        Index("ix_questions_type_difficulty", "question_type", "difficulty"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id", name="fk_questions_topic_id_topics", ondelete="CASCADE"), nullable=False)
+    question_text: Mapped[str] = mapped_column(Text, nullable=False)
+    explanation: Mapped[str] = mapped_column(Text, nullable=False)
+    difficulty: Mapped[str] = mapped_column(String(16), default="MEDIUM", nullable=False)
+    question_type: Mapped[str] = mapped_column(String(16), default="MCQ", nullable=False)
+    source: Mapped[str] = mapped_column(String(200), default="Prashna demo questions", nullable=False)
+    is_published: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+    topic: Mapped[Topic] = relationship()
+    options: Mapped[list["QuestionOption"]] = relationship(
+        back_populates="question", cascade="all, delete-orphan", order_by="QuestionOption.display_order")
+
+
+class QuestionOption(Base):
+    __tablename__ = "question_options"
+    __table_args__ = (
+        UniqueConstraint("question_id", "display_order", name="uq_question_options_question_order"),
+        Index("ix_question_options_question", "question_id"),
+        # At most one option may be correct. Published demo questions are seeded
+        # with exactly one correct option, and the API validates the answer key.
+        Index("uq_question_options_one_correct", "question_id", unique=True,
+              sqlite_where=text("is_correct = 1"), postgresql_where=text("is_correct IS TRUE")),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    question_id: Mapped[int] = mapped_column(ForeignKey("questions.id", name="fk_question_options_question_id_questions", ondelete="CASCADE"), nullable=False)
+    option_text: Mapped[str] = mapped_column(Text, nullable=False)
+    is_correct: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    display_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    question: Mapped[Question] = relationship(back_populates="options")
+
+
+class UserQuestionAttempt(Base):
+    __tablename__ = "user_question_attempts"
+    __table_args__ = (
+        Index("ix_user_question_attempts_user_time", "user_id", "attempted_at"),
+        Index("ix_user_question_attempts_question", "question_id"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("profiles.id", name="fk_user_question_attempts_user_id_profiles", ondelete="CASCADE"), nullable=False)
+    question_id: Mapped[int] = mapped_column(ForeignKey("questions.id", name="fk_user_question_attempts_question_id_questions", ondelete="CASCADE"), nullable=False)
+    selected_option_id: Mapped[int] = mapped_column(ForeignKey("question_options.id", name="fk_user_question_attempts_selected_option_id_question_options"), nullable=False)
+    is_correct: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    question: Mapped[Question] = relationship()
+    selected_option: Mapped[QuestionOption] = relationship()
