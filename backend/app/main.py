@@ -149,13 +149,87 @@ def get_topic(slug: str, db: Session = Depends(get_db), user: AuthUser = Depends
         LearningContent.is_published.is_(True)).order_by(LearningContent.id).all()
     question_count = db.query(Question.id).filter(Question.topic_id == topic.id,
         Question.is_published.is_(True), Question.question_type == "MCQ").count()
+    attempted_count = db.query(func.count(func.distinct(UserQuestionAttempt.question_id))).join(Question).filter(
+        UserQuestionAttempt.user_id == user.id, Question.topic_id == topic.id,
+        Question.is_published.is_(True), Question.question_type == "MCQ").scalar() or 0
+    reading_completed = bool(progress and progress.reading_completed_at)
+    topic_completed = bool(progress and progress.completed_at)
+    practice_percent = (min(attempted_count, question_count) / question_count) if question_count else 0
+    progress_percent = 100 if topic_completed else round((int(reading_completed) + practice_percent) * 50)
     children = db.query(Topic).filter(Topic.parent_topic_id == topic.id, Topic.is_active.is_(True)).order_by(Topic.display_order).all()
     return {"id": topic.id, "name": topic.name, "slug": topic.slug, "description": topic.description,
         "parent_topic_id": topic.parent_topic_id,
         "subject": {"id": topic.subject.id, "name": topic.subject.name, "slug": topic.subject.slug},
-        "completed": bool(progress and progress.completed_at),
+        "completed": topic_completed, "reading_completed": reading_completed,
+        "reading_completed_at": progress.reading_completed_at if progress else None,
+        "practice_attempted": min(attempted_count, question_count), "practice_completed": bool(question_count and attempted_count >= question_count),
+        "progress_percent": progress_percent,
         "children": [{"id": child.id, "name": child.name, "slug": child.slug, "description": child.description} for child in children],
         "content": [learning_content_json(row) for row in content_rows], "question_count": question_count}
+
+
+@app.post("/api/topics/{slug}/reading-complete")
+def complete_topic_reading(slug: str, db: Session = Depends(get_db), user: AuthUser = Depends(current_user),
+                           timezone_name: str | None = Header(default=None, alias="X-User-Timezone")):
+    topic = db.query(Topic).filter(Topic.slug == slug, Topic.is_active.is_(True)).first()
+    if topic is None:
+        raise HTTPException(404, "Topic not found")
+    ensure_profile(db, user)
+    progress = db.query(UserTopicProgress).filter_by(user_id=user.id, topic_id=topic.id).first()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    newly_completed = progress is None or progress.reading_completed_at is None
+    if progress is None:
+        progress = UserTopicProgress(user_id=user.id, topic_id=topic.id, reading_completed_at=now, updated_at=now)
+        db.add(progress)
+    elif newly_completed:
+        progress.reading_completed_at = now
+        progress.updated_at = now
+    if newly_completed:
+        record_activity(db, user, "READING_COMPLETE", local_today(timezone_name), {"topic_slug": topic.slug})
+    db.commit()
+    return {"topic_slug": topic.slug, "reading_completed": True, "reading_completed_at": progress.reading_completed_at}
+
+
+@app.get("/api/me/progress")
+def learning_progress(db: Session = Depends(get_db), user: AuthUser = Depends(current_user)):
+    topics = db.query(Topic).filter(Topic.is_active.is_(True)).order_by(Topic.name).all()
+    progress_rows = db.query(UserTopicProgress).filter(UserTopicProgress.user_id == user.id).all()
+    progress_by_topic = {row.topic_id: row for row in progress_rows}
+    attempt_rows = db.query(UserQuestionAttempt, Question, Topic).join(
+        Question, UserQuestionAttempt.question_id == Question.id
+    ).join(Topic, Question.topic_id == Topic.id).filter(
+        UserQuestionAttempt.user_id == user.id, Question.is_published.is_(True), Question.question_type == "MCQ"
+    ).all()
+    stats: dict[int, dict] = defaultdict(lambda: {"attempts": 0, "correct": 0, "question_ids": set(), "latest": None})
+    for attempt, question, topic in attempt_rows:
+        item = stats[topic.id]
+        item["attempts"] += 1
+        item["correct"] += int(attempt.is_correct)
+        item["question_ids"].add(question.id)
+        if item["latest"] is None or attempt.attempted_at > item["latest"]:
+            item["latest"] = attempt.attempted_at
+    completed = [topic for topic in topics if (progress_by_topic.get(topic.id) and progress_by_topic[topic.id].completed_at)]
+    in_progress = [topic for topic in topics if topic.id not in {x.id for x in completed} and (
+        (progress_by_topic.get(topic.id) and progress_by_topic[topic.id].reading_completed_at) or stats[topic.id]["attempts"]
+    )]
+    question_attempts = sum(item["attempts"] for item in stats.values())
+    correct_total = sum(item["correct"] for item in stats.values())
+    weak = []
+    for topic in topics:
+        item = stats[topic.id]
+        accuracy = round(item["correct"] * 100 / item["attempts"]) if item["attempts"] else 0
+        if len(item["question_ids"]) >= 3 and accuracy < 60:
+            weak.append({"id": topic.id, "name": topic.name, "slug": topic.slug,
+                         "questions_attempted": len(item["question_ids"]),
+                         "attempts": item["attempts"], "accuracy": accuracy})
+    recent = sorted((topic for topic in completed if progress_by_topic[topic.id].completed_at),
+                    key=lambda topic: progress_by_topic[topic.id].completed_at, reverse=True)[:5]
+    return {"topics_completed": len(completed), "topics_in_progress": len(in_progress),
+        "practice_questions_attempted": question_attempts,
+        "practice_accuracy": round(correct_total * 100 / question_attempts) if question_attempts else 0,
+        "recently_completed": [{"id": topic.id, "name": topic.name, "slug": topic.slug,
+            "completed_at": progress_by_topic[topic.id].completed_at} for topic in recent],
+        "weak_topics": weak, "review_mistakes_count": sum(1 for attempt, _, _ in attempt_rows if not attempt.is_correct)}
 
 
 @app.post("/api/topics/{slug}/complete")
@@ -232,7 +306,7 @@ def submit_question_attempt(question_id: int, data: QuestionAttemptIn, db: Sessi
 
 
 @app.get("/api/me/question-attempts")
-def question_attempt_history(topic_slug: str | None = None,
+def question_attempt_history(topic_slug: str | None = None, mistakes_only: bool = False,
                              limit: int = Query(100, ge=1, le=100),
                              db: Session = Depends(get_db), user: AuthUser = Depends(current_user)):
     query = db.query(UserQuestionAttempt).join(Question).options(
@@ -241,6 +315,8 @@ def question_attempt_history(topic_slug: str | None = None,
     ).filter(UserQuestionAttempt.user_id == user.id)
     if topic_slug:
         query = query.join(Topic, Question.topic_id == Topic.id).filter(Topic.slug == topic_slug)
+    if mistakes_only:
+        query = query.filter(UserQuestionAttempt.is_correct.is_(False))
     attempts = query.order_by(UserQuestionAttempt.attempted_at.desc(), UserQuestionAttempt.id.desc()).limit(limit).all()
     result = []
     for attempt in attempts:
@@ -251,7 +327,8 @@ def question_attempt_history(topic_slug: str | None = None,
             "correct_option_id": correct.id if correct else None,
             "correct_answer": correct.option_text if correct else None,
             "is_correct": attempt.is_correct, "explanation": attempt.question.explanation,
-            "attempted_at": attempt.attempted_at})
+            "attempted_at": attempt.attempted_at, "topic": attempt.question.topic.name,
+            "topic_slug": attempt.question.topic.slug, "source": attempt.question.source})
     return result
 
 @app.get("/api/feed")

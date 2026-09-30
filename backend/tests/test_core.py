@@ -70,6 +70,8 @@ def test_auth_required_without_bearer():
     response = TestClient(app).get("/api/bookmarks")
     assert response.status_code == 401
     assert TestClient(app).get("/api/topics/private-topic/questions").status_code == 401
+    assert TestClient(app).get("/api/me/progress").status_code == 401
+    assert TestClient(app).post("/api/topics/private-topic/reading-complete").status_code == 401
 
 
 def test_bookmark_idempotency_and_user_isolation(harness):
@@ -265,6 +267,64 @@ def test_question_attempt_correct_incorrect_and_persists_user_identity(harness):
     assert db.query(UserActivity).filter_by(user_id=user.id, activity_type="QUESTION_ATTEMPT").count() == 1
     assert client.get("/api/me/question-attempts?topic_slug=wrong-topic").json()[0]["selected_answer"] == "Incorrect answer"
     db.close()
+
+
+def test_reading_completion_is_authenticated_idempotent_and_separate_from_topic_completion(harness):
+    client, factory, user, _, _, _ = harness
+    db = factory(); topic, _, _, _ = add_practice_question(db, slug="reading-topic")
+    db.commit(); db.close()
+
+    assert client.post(f"/api/topics/{topic.slug}/reading-complete").status_code == 200
+    first = client.get(f"/api/topics/{topic.slug}").json()
+    assert first["reading_completed"] is True
+    assert first["completed"] is False
+    assert first["progress_percent"] == 50
+    assert first["reading_completed_at"]
+    assert client.post(f"/api/topics/{topic.slug}/reading-complete").status_code == 200
+    db = factory(); progress = db.query(UserTopicProgress).filter_by(user_id=user.id, topic_id=topic.id).one()
+    saved_time = progress.reading_completed_at
+    assert saved_time is not None
+    assert progress.completed_at is None
+    assert db.query(UserActivity).filter_by(user_id=user.id, activity_type="READING_COMPLETE").count() == 1
+    db.close()
+    assert client.post(f"/api/topics/{topic.slug}/complete").json()["completed"] is True
+    assert client.get(f"/api/topics/{topic.slug}").json()["completed"] is True
+
+
+def test_progress_accuracy_weak_topics_mistakes_and_user_isolation(harness):
+    client, factory, user, _, _, _ = harness
+    db = factory()
+    topic, q1, correct1, wrong1 = add_practice_question(db, slug="weak-topic", question_text="Sample one?")
+    _, q2, correct2, wrong2 = add_practice_question(db, slug="weak-topic", question_text="Sample two?")
+    _, q3, correct3, wrong3 = add_practice_question(db, slug="weak-topic", question_text="Sample three?")
+    completed_topic, _, _, _ = add_practice_question(db, slug="completed-topic", question_text="Completed sample?")
+    db.add(UserTopicProgress(user_id=user.id, topic_id=completed_topic.id, completed_at=datetime.now(timezone.utc).replace(tzinfo=None)))
+    db.commit(); db.close()
+    for question, option in ((q1, correct1), (q2, wrong2), (q3, wrong3)):
+        result = client.post(f"/api/questions/{question.id}/attempt", json={"option_id": option.id})
+        assert result.status_code == 200
+        if question.id == q1.id:
+            assert client.get(f"/api/topics/{topic.slug}").json()["progress_percent"] == 17
+    summary = client.get("/api/me/progress").json()
+    assert summary["topics_completed"] == 1
+    assert summary["topics_in_progress"] == 1
+    assert summary["practice_questions_attempted"] == 3
+    assert summary["practice_accuracy"] == 33
+    assert summary["weak_topics"] == [{"id": topic.id, "name": topic.name, "slug": topic.slug,
+        "questions_attempted": 3, "attempts": 3, "accuracy": 33}]
+    assert summary["recently_completed"][0]["slug"] == completed_topic.slug
+    mistakes = client.get("/api/me/question-attempts?mistakes_only=true").json()
+    assert len(mistakes) == 2
+    assert all(row["topic_slug"] == topic.slug and row["source"] == "Prashna demo questions" for row in mistakes)
+    assert all(row["correct_answer"] == "Correct answer" and row["explanation"] for row in mistakes)
+
+    other_id = str(uuid4())
+    db = factory(); db.add(Profile(id=other_id, display_name="Other", email="other@example.com")); db.commit(); db.close()
+    app.dependency_overrides[current_user] = lambda: AuthUser(other_id, "other@example.com", {}, {})
+    isolated = client.get("/api/me/progress").json()
+    assert isolated["topics_completed"] == isolated["topics_in_progress"] == 0
+    assert isolated["practice_questions_attempted"] == isolated["review_mistakes_count"] == 0
+    assert client.get("/api/me/question-attempts?mistakes_only=true").json() == []
 
 
 def test_question_attempt_rejects_invalid_or_foreign_options(harness):
