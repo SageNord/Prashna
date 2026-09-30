@@ -7,6 +7,9 @@ from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 import logging
 import os
+import socket
+import ssl
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
@@ -17,7 +20,7 @@ from .relevance import utc_naive
 log = logging.getLogger(__name__)
 MAX_FEED_BYTES = 2_000_000
 DEFAULT_FEEDS = (
-    ("Press Information Bureau", "https://www.pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=1", 100),
+    ("Press Information Bureau", "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=1", 100),
     ("Reserve Bank of India", "https://rbi.org.in/pressreleases_rss.xml", 95),
 )
 
@@ -88,18 +91,40 @@ def configured_sources() -> list[FeedSource]:
     return sources
 
 
-def fetch_feed(source: FeedSource, timeout: float = 12.0, limit: int = 40) -> list[RawArticle]:
+def fetch_feed(source: FeedSource, timeout: float = 20.0, limit: int = 40) -> list[RawArticle]:
     if not source.url.startswith("https://"):
         raise ValueError("RSS feeds must use HTTPS")
-    request = Request(source.url, headers={"User-Agent": "PrashnaCurrentAffairs/1.0 (+https://prashna-xi.vercel.app)", "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml"})
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            content_type = response.headers.get_content_type()
-            if content_type not in {"application/rss+xml", "application/atom+xml", "application/xml", "text/xml", "application/octet-stream"}:
-                raise ValueError(f"Unexpected RSS content type: {content_type}")
-            payload = response.read(MAX_FEED_BYTES + 1)
-    except (HTTPError, URLError, TimeoutError) as exc:
-        raise RuntimeError(f"RSS fetch failed for {source.name}: {type(exc).__name__}") from exc
+    request = Request(source.url, headers={
+        # PIB's public endpoint is served by the main website and may reject
+        # non-browser user agents at its edge. This identifies a regular client
+        # without including app credentials or user data.
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    payload = None
+    for attempt in range(3):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                content_type = response.headers.get_content_type()
+                if content_type not in {"application/rss+xml", "application/atom+xml", "application/xml", "text/xml", "application/octet-stream"}:
+                    raise ValueError(f"Unexpected RSS content type: {content_type}")
+                payload = response.read(MAX_FEED_BYTES + 1)
+            break
+        except HTTPError as exc:
+            # Retry only throttling and server-side failures; auth/not-found
+            # responses are deterministic and should surface immediately.
+            if (exc.code == 429 or 500 <= exc.code <= 599) and attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            raise RuntimeError(f"RSS request returned HTTP {exc.code}") from None
+        except (URLError, TimeoutError, socket.timeout, ssl.SSLError, OSError) as exc:
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            raise RuntimeError(f"RSS request failed: {_safe_network_reason(exc)}") from None
+    if payload is None:
+        raise RuntimeError("RSS request failed after retries")
     if len(payload) > MAX_FEED_BYTES:
         raise ValueError(f"RSS feed exceeded the {MAX_FEED_BYTES} byte limit")
     try:
@@ -117,7 +142,7 @@ def fetch_feed(source: FeedSource, timeout: float = 12.0, limit: int = 40) -> li
         link = _node_text(link_node)
         if link_node is not None and not link:
             link = link_node.attrib.get("href", "")
-        identifier = _node_text(fields.get("guid") or fields.get("id")) or None
+        identifier = _node_text(_first_field(fields, "guid", "id")) or None
         if not link and identifier and identifier.startswith("https://"):
             link = identifier
         try:
@@ -125,12 +150,34 @@ def fetch_feed(source: FeedSource, timeout: float = 12.0, limit: int = 40) -> li
         except ValueError:
             # Invalid/non-HTTPS source links are not safe to publish or fetch.
             continue
-        published = _parse_datetime(_node_text(fields.get("pubDate") or fields.get("published") or fields.get("updated") or fields.get("date")))
-        summary = strip_html(_node_text(fields.get("encoded") or fields.get("description") or fields.get("summary") or fields.get("content")))[:12000]
+        published = _parse_datetime(_node_text(_first_field(fields, "pubDate", "published", "updated", "date")))
+        summary = strip_html(_node_text(_first_field(fields, "encoded", "description", "summary", "content")))[:12000]
         articles.append(RawArticle(title=title[:300], url=canonical, source=source.name,
                                    source_identifier=(identifier or canonical)[:1000],
                                    published_at=utc_naive(published), summary=summary))
     return articles
+
+
+def _safe_network_reason(error: BaseException) -> str:
+    """Describe transport failures without echoing URLs, headers, or credentials."""
+    reason = error.reason if isinstance(error, URLError) else error
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return "request timed out"
+    if isinstance(reason, ssl.SSLError):
+        return "TLS connection failed"
+    if isinstance(reason, socket.gaierror):
+        return "DNS lookup failed"
+    if isinstance(reason, ConnectionResetError):
+        return "remote connection reset"
+    if isinstance(reason, ConnectionRefusedError):
+        return "remote connection refused"
+    if isinstance(reason, OSError):
+        return f"network OS error ({reason.errno})" if reason.errno is not None else "network OS error"
+    # URLError often wraps a plain string such as "timed out". Map only known
+    # safe phrases; arbitrary exception strings can contain URLs or secrets.
+    if isinstance(reason, str) and "timed out" in reason.lower():
+        return "request timed out"
+    return type(reason).__name__
 
 
 def _local_name(tag: str) -> str:
@@ -141,6 +188,15 @@ def _node_text(node: ET.Element | None) -> str:
     if node is None:
         return ""
     return " ".join("".join(node.itertext()).split()).strip()
+
+
+def _first_field(fields: dict[str, ET.Element], *names: str) -> ET.Element | None:
+    """Pick by presence, not Element truthiness (text-only XML nodes are falsey)."""
+    for name in names:
+        node = fields.get(name.lower())
+        if node is not None:
+            return node
+    return None
 
 
 def _parse_datetime(value: str) -> datetime | None:

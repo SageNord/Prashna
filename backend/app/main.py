@@ -7,6 +7,7 @@ import os
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -15,19 +16,66 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 
 from .auth import AuthUser, current_user, require_admin
 from .database import get_db, SessionLocal
-from .models import (Article, ArticleGSTag, ArticleSource, ArticleTopic, DailyQuizAttempt, IngestionRun, KeyFact, Profile,
-    LearningContent, Question, QuestionOption, QuizOption, QuizQuestion, Subject, Topic, UserActivity,
+from .models import (Article, ArticleGSTag, ArticleSource, ArticleTopic, ContentIngestionJob, DailyQuizAttempt, IngestionRun, KeyFact, LearningCard, LearningCardSourceRef, Profile, QuestionTopicClassification,
+    LearningContent, Question, QuestionOption, QuizOption, QuizQuestion, SourceChunk, SourceDocument, Subject, Topic, UserActivity,
     UserBookmark, UserQuestionAttempt, UserQuizAttempt, UserRevision, UserTopicProgress)
 from .schemas import ArticleIn, AttemptIn, IngestIn, ProfileUpdate, QuestionAttemptIn, RevisionIn
 from .services.ingestion import process_stored_article, run_ingestion
 from .services.relevance import classify_relevance, event_fingerprint, utc_naive
 from .services.sources import canonicalize_url, configured_sources
 from .services.streaks import streak_metrics
+from .services.content_pipeline import publish_card, publish_pyq, register_document, validation_report
 
 logger = logging.getLogger("prashna.api")
 app=FastAPI(title="Prashna API",version="2.0.0")
 cors_origins=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:5173,http://127.0.0.1:5173").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware,allow_origins=cors_origins,allow_methods=["GET","POST","PATCH","DELETE","OPTIONS"],allow_headers=["Authorization","Content-Type","X-User-Timezone","X-Cron-Secret"],max_age=600)
+
+
+class SourceDocumentIn(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    publisher: str = Field(min_length=1, max_length=200)
+    source_type: str
+    file_path: str
+    source_url: str | None = None
+    subject_id: int | None = None
+    topic_id: int | None = None
+    publication_year: int | None = None
+    version: str | None = None
+    license_notes: str | None = None
+
+
+class LearningCardIn(BaseModel):
+    topic_id: int
+    title: str = Field(min_length=1, max_length=240)
+    slug: str = Field(min_length=1, max_length=260)
+    content: str = Field(min_length=1)
+    source_chunk_ids: list[int] = Field(min_length=1)
+    classification_confidence: float = Field(ge=0, le=1)
+
+
+class PYQOptionIn(BaseModel):
+    text: str = Field(min_length=1)
+
+
+class PYQIn(BaseModel):
+    topic_id: int
+    year: int = Field(ge=1900, le=2100)
+    exam: str = Field(min_length=1, max_length=120)
+    stage: str = Field(min_length=1, max_length=80)
+    paper: str = Field(min_length=1, max_length=120)
+    question_number: str = Field(min_length=1, max_length=40)
+    question_text: str = Field(min_length=1)
+    explanation: str = Field(default="")
+    source_document_id: int
+    options: list[PYQOptionIn] = Field(min_length=2)
+    verified_answer_option: int | None = None
+    classification_confidence: float = Field(ge=0, le=1)
+
+
+class PYQAnswerIn(BaseModel):
+    correct_option: int = Field(ge=1, le=6)
+    explanation: str = ""
 
 def local_today(tz_name:str|None)->date:
     try:tz=ZoneInfo(tz_name or "UTC")
@@ -101,6 +149,17 @@ def learning_content_json(row: LearningContent) -> dict:
         "estimated_minutes": row.estimated_minutes, "source": row.source, "source_url": row.source_url}
 
 
+def learning_card_json(db: Session, card: LearningCard) -> dict:
+    refs = db.query(LearningCardSourceRef, SourceChunk, SourceDocument).join(
+        SourceChunk, LearningCardSourceRef.source_chunk_id == SourceChunk.id).join(
+        SourceDocument, SourceChunk.document_id == SourceDocument.id).filter(
+        LearningCardSourceRef.card_id == card.id).order_by(LearningCardSourceRef.reference_order).all()
+    return {"id": card.id, "title": card.title, "content": card.content, "display_order": card.display_order,
+        "content_origin": card.content_origin, "sources": [{"title": doc.title, "publisher": doc.publisher,
+            "source_type": doc.source_type, "source_url": doc.source_url, "page_number": chunk.page_number,
+            "section": chunk.section, "attribution_note": ref.attribution_note} for ref, chunk, doc in refs]}
+
+
 def subject_json(db: Session, subject: Subject, user_id: str) -> dict:
     topic_ids = db.query(Topic.id).filter(Topic.subject_id == subject.id, Topic.is_active.is_(True)).all()
     ids = [row[0] for row in topic_ids]
@@ -147,8 +206,13 @@ def get_topic(slug: str, db: Session = Depends(get_db), user: AuthUser = Depends
     progress = db.query(UserTopicProgress).filter_by(user_id=user.id, topic_id=topic.id).first()
     content_rows = db.query(LearningContent).filter(LearningContent.topic_id == topic.id,
         LearningContent.is_published.is_(True)).order_by(LearningContent.id).all()
+    cards = db.query(LearningCard).filter(LearningCard.topic_id == topic.id,
+        LearningCard.status == "PUBLISHED").order_by(LearningCard.display_order, LearningCard.id).all()
     question_count = db.query(Question.id).filter(Question.topic_id == topic.id,
-        Question.is_published.is_(True), Question.question_type == "MCQ").count()
+        Question.is_published.is_(True), Question.status == "PUBLISHED", Question.question_type == "MCQ").count()
+    pyq_count = db.query(Question.id).filter(Question.topic_id == topic.id,
+        Question.is_published.is_(True), Question.status == "PUBLISHED", Question.source_type == "UPSC_PYQ",
+        Question.question_type == "MCQ").count()
     attempted_count = db.query(func.count(func.distinct(UserQuestionAttempt.question_id))).join(Question).filter(
         UserQuestionAttempt.user_id == user.id, Question.topic_id == topic.id,
         Question.is_published.is_(True), Question.question_type == "MCQ").scalar() or 0
@@ -165,7 +229,138 @@ def get_topic(slug: str, db: Session = Depends(get_db), user: AuthUser = Depends
         "practice_attempted": min(attempted_count, question_count), "practice_completed": bool(question_count and attempted_count >= question_count),
         "progress_percent": progress_percent,
         "children": [{"id": child.id, "name": child.name, "slug": child.slug, "description": child.description} for child in children],
-        "content": [learning_content_json(row) for row in content_rows], "question_count": question_count}
+        "content": [learning_content_json(row) for row in content_rows],
+        "reading_cards": [learning_card_json(db, card) for card in cards], "question_count": question_count,
+        "pyq_count": pyq_count}
+
+
+@app.post("/api/admin/source-documents", status_code=202)
+def enqueue_source_document(data: SourceDocumentIn, db: Session = Depends(get_db), _: AuthUser = Depends(require_admin)):
+    try:
+        document, duplicate = register_document(db, **data.model_dump())
+    except (ValueError, OSError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    job = db.query(ContentIngestionJob).filter_by(document_id=document.id).order_by(ContentIngestionJob.id.desc()).first()
+    return {"document_id": document.id, "job_id": job.id if job else None,
+            "status": document.ingestion_status, "duplicate": duplicate}
+
+
+@app.get("/api/admin/content-validation")
+def content_validation(db: Session = Depends(get_db), _: AuthUser = Depends(require_admin)):
+    return validation_report(db)
+
+
+@app.get("/api/admin/source-documents/{document_id}")
+def review_source_document(document_id: int, db: Session = Depends(get_db), _: AuthUser = Depends(require_admin)):
+    document = db.get(SourceDocument, document_id)
+    if not document:
+        raise HTTPException(404, "Source document not found")
+    chunks = db.query(SourceChunk).filter_by(document_id=document.id).order_by(SourceChunk.chunk_index).all()
+    jobs = db.query(ContentIngestionJob).filter_by(document_id=document.id).order_by(ContentIngestionJob.id.desc()).all()
+    return {"id": document.id, "title": document.title, "publisher": document.publisher,
+        "source_type": document.source_type, "source_url": document.source_url,
+        "publication_year": document.publication_year, "ingestion_status": document.ingestion_status,
+        "checksum": document.checksum, "chunks": [{"id": chunk.id, "page_number": chunk.page_number,
+            "section": chunk.section, "text": chunk.text} for chunk in chunks],
+        "jobs": [{"id": job.id, "status": job.status, "phase": job.phase,
+            "error_summary": job.error_summary} for job in jobs]}
+
+
+@app.get("/api/admin/pyqs/{question_id}")
+def review_pyq(question_id: int, db: Session = Depends(get_db), _: AuthUser = Depends(require_admin)):
+    question = db.query(Question).options(selectinload(Question.options)).filter(
+        Question.id == question_id, Question.source_type == "UPSC_PYQ").first()
+    if not question:
+        raise HTTPException(404, "PYQ not found")
+    return {"id": question.id, "status": question.status, "is_published": question.is_published,
+        "year": question.year, "exam": question.exam, "stage": question.stage, "paper": question.paper,
+        "question_number": question.question_number, "question_text": question.question_text,
+        "explanation": question.explanation, "source_url": question.source_document.source_url if question.source_document else None,
+        "options": [{"id": option.id, "text": option.option_text, "verified_correct": option.is_correct}
+                    for option in question.options]}
+
+
+@app.post("/api/admin/pyqs/{question_id}/answer")
+def verify_pyq_answer(question_id: int, data: PYQAnswerIn, db: Session = Depends(get_db), _: AuthUser = Depends(require_admin)):
+    question = db.query(Question).options(selectinload(Question.options)).filter(
+        Question.id == question_id, Question.source_type == "UPSC_PYQ", Question.status == "REVIEW",
+        Question.is_published.is_(False)).first()
+    if not question:
+        raise HTTPException(404, "Unpublished review PYQ not found")
+    if data.correct_option > len(question.options):
+        raise HTTPException(422, "Correct option is outside the question's option list")
+    for index, option in enumerate(question.options, 1):
+        option.is_correct = index == data.correct_option
+    if data.explanation.strip():
+        question.explanation = data.explanation
+    db.commit()
+    return {"id": question.id, "answer_verified": True, "status": question.status}
+
+
+@app.post("/api/admin/learning-cards", status_code=201)
+def create_learning_card(data: LearningCardIn, db: Session = Depends(get_db), _: AuthUser = Depends(require_admin)):
+    if not db.get(Topic, data.topic_id):
+        raise HTTPException(422, "Topic does not exist")
+    if db.query(LearningCard).filter_by(slug=data.slug).first():
+        raise HTTPException(409, "A learning card with this slug already exists")
+    chunks = db.query(SourceChunk).filter(SourceChunk.id.in_(data.source_chunk_ids)).all()
+    if len(chunks) != len(data.source_chunk_ids) or len(set(data.source_chunk_ids)) != len(data.source_chunk_ids):
+        raise HTTPException(422, "One or more source chunks do not exist")
+    card = LearningCard(topic_id=data.topic_id, title=data.title.strip(), slug=data.slug.strip(), content=data.content.strip(),
+        display_order=(db.query(func.max(LearningCard.display_order)).filter_by(topic_id=data.topic_id).scalar() or 0) + 1,
+        status="REVIEW", content_origin="PRASHNA_SUMMARY", classification_method="MANUAL",
+        classification_confidence=data.classification_confidence)
+    db.add(card); db.flush()
+    for position, chunk in enumerate(chunks, 1):
+        db.add(LearningCardSourceRef(card_id=card.id, source_chunk_id=chunk.id, reference_order=position,
+            attribution_note="Source-based Prashna summary; verify claims and page attribution before publishing."))
+    db.commit()
+    return {"id": card.id, "status": card.status, "source_refs": len(chunks)}
+
+
+@app.post("/api/admin/pyqs", status_code=201)
+def register_pyq(data: PYQIn, db: Session = Depends(get_db), _: AuthUser = Depends(require_admin)):
+    source = db.get(SourceDocument, data.source_document_id)
+    if not source or source.source_type != "UPSC":
+        raise HTTPException(422, "PYQ source must be an identified UPSC document")
+    duplicate = db.query(Question).filter_by(source_type="UPSC_PYQ", year=data.year, exam=data.exam,
+        stage=data.stage, paper=data.paper, question_number=data.question_number).first()
+    if duplicate:
+        return {"id": duplicate.id, "status": duplicate.status, "duplicate": True}
+    if not db.get(Topic, data.topic_id):
+        raise HTTPException(422, "Topic does not exist")
+    if data.verified_answer_option is not None and not 0 <= data.verified_answer_option < len(data.options):
+        raise HTTPException(422, "Verified answer option is outside the option list")
+    question = Question(topic_id=data.topic_id, question_text=data.question_text, explanation=data.explanation,
+        difficulty="MEDIUM", question_type="MCQ", source=f"UPSC {data.exam} {data.year}", is_published=False,
+        source_type="UPSC_PYQ", year=data.year, exam=data.exam, stage=data.stage, paper=data.paper,
+        question_number=data.question_number, source_document_id=source.id, status="REVIEW",
+        classification_method="MANUAL", classification_confidence=data.classification_confidence)
+    question.options = [QuestionOption(option_text=option.text, is_correct=(index == data.verified_answer_option), display_order=index)
+                        for index, option in enumerate(data.options)]
+    db.add(question); db.flush()
+    db.add(QuestionTopicClassification(question_id=question.id, topic_id=data.topic_id,
+        classification_method="MANUAL", confidence=data.classification_confidence, review_status="REVIEW"))
+    db.commit(); db.refresh(question)
+    return {"id": question.id, "status": question.status, "duplicate": False}
+
+
+@app.post("/api/admin/learning-cards/{card_id}/publish")
+def publish_learning_card(card_id: int, db: Session = Depends(get_db), _: AuthUser = Depends(require_admin)):
+    try:
+        card = publish_card(db, card_id)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"id": card.id, "status": card.status}
+
+
+@app.post("/api/admin/questions/{question_id}/publish")
+def publish_question(question_id: int, db: Session = Depends(get_db), _: AuthUser = Depends(require_admin)):
+    try:
+        question = publish_pyq(db, question_id)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"id": question.id, "status": question.status, "is_published": question.is_published}
 
 
 @app.post("/api/topics/{slug}/reading-complete")
@@ -259,19 +454,32 @@ def complete_topic(slug: str, db: Session = Depends(get_db), user: AuthUser = De
 def question_public_json(question: Question) -> dict:
     return {"id": question.id, "question_text": question.question_text,
         "difficulty": question.difficulty, "question_type": question.question_type,
-        "source": question.source,
+        "source": question.source, "source_type": question.source_type,
+        "year": question.year, "exam": question.exam, "stage": question.stage,
+        "paper": question.paper, "question_number": question.question_number,
+        "source_url": question.source_document.source_url if question.source_document else None,
         "options": [{"id": option.id, "text": option.option_text} for option in question.options]}
 
 
-@app.get("/api/topics/{slug}/questions")
-def topic_questions(slug: str, db: Session = Depends(get_db), user: AuthUser = Depends(current_user)):
+def _topic_questions(slug: str, db: Session, source_type: str):
     topic = db.query(Topic).filter(Topic.slug == slug, Topic.is_active.is_(True)).first()
     if topic is None:
         raise HTTPException(404, "Topic not found")
     questions = db.query(Question).options(selectinload(Question.options)).filter(
-        Question.topic_id == topic.id, Question.is_published.is_(True), Question.question_type == "MCQ"
+        Question.topic_id == topic.id, Question.is_published.is_(True), Question.status == "PUBLISHED",
+        Question.source_type == source_type, Question.question_type == "MCQ"
     ).order_by(Question.id).all()
     return [question_public_json(question) for question in questions]
+
+
+@app.get("/api/topics/{slug}/questions")
+def topic_questions(slug: str, db: Session = Depends(get_db), user: AuthUser = Depends(current_user)):
+    return _topic_questions(slug, db, "SAMPLE")
+
+
+@app.get("/api/topics/{slug}/pyqs")
+def topic_pyqs(slug: str, db: Session = Depends(get_db), user: AuthUser = Depends(current_user)):
+    return _topic_questions(slug, db, "UPSC_PYQ")
 
 
 @app.post("/api/questions/{question_id}/attempt")
@@ -279,7 +487,8 @@ def submit_question_attempt(question_id: int, data: QuestionAttemptIn, db: Sessi
                             user: AuthUser = Depends(current_user),
                             timezone_name: str | None = Header(default=None, alias="X-User-Timezone")):
     question = db.query(Question).options(selectinload(Question.options)).filter(
-        Question.id == question_id, Question.is_published.is_(True), Question.question_type == "MCQ"
+        Question.id == question_id, Question.is_published.is_(True), Question.status == "PUBLISHED",
+        Question.question_type == "MCQ"
     ).first()
     if question is None:
         raise HTTPException(404, "Question not found")

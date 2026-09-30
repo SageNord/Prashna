@@ -12,7 +12,7 @@ from app.database import Base, get_db
 import app.main as api_module
 from app.main import app, require_admin
 from app.models import (Article, ArticleTopic, DailyQuizAttempt, LearningContent, Profile, Question,
-                        QuestionOption, QuizOption, QuizQuestion, Subject, Topic, UserActivity,
+                        QuestionOption, QuizOption, QuizQuestion, SourceDocument, Subject, Topic, UserActivity,
                         UserBookmark, UserQuestionAttempt, UserRevision, UserTopicProgress)
 from app.services.llm import MockProvider, get_provider, transform_source
 from app.services.streaks import streak_metrics
@@ -345,6 +345,37 @@ def test_unpublished_question_cannot_be_retrieved_or_attempted(harness):
     db.commit()
     assert client.get(f"/api/topics/{topic.slug}/questions").json() == []
     assert client.post(f"/api/questions/{question.id}/attempt", json={"option_id": option.id}).status_code == 404
+
+
+def test_published_pyqs_are_separate_from_sample_questions_and_answers_are_hidden(harness):
+    client, factory, _, _, _, _ = harness
+    db = factory()
+    topic, sample, _, _ = add_practice_question(db, slug="pyq-topic")
+    source = SourceDocument(title="UPSC paper", publisher="UPSC", source_type="UPSC",
+        source_url="https://www.upsc.gov.in/paper.pdf", ingestion_status="PUBLISHED")
+    db.add(source); db.flush()
+    published = Question(topic_id=topic.id, question_text="Actual question text", explanation="Reason",
+        source="UPSC CSE Prelims — 2024", is_published=True, source_type="UPSC_PYQ", year=2024,
+        exam="Civil Services Examination", stage="Prelims", paper="General Studies Paper I",
+        question_number="76", source_document_id=source.id, status="PUBLISHED")
+    hidden = Question(topic_id=topic.id, question_text="Unreviewed PYQ", explanation="Pending",
+        source="UPSC CSE Prelims — 2023", is_published=False, source_type="UPSC_PYQ", year=2023,
+        exam="Civil Services Examination", stage="Prelims", paper="General Studies Paper I",
+        question_number="20", source_document_id=source.id, status="REVIEW")
+    for row in (published, hidden):
+        row.options = [QuestionOption(option_text="A", is_correct=True, display_order=0),
+                       QuestionOption(option_text="B", is_correct=False, display_order=1)]
+        db.add(row)
+    db.commit()
+    samples = client.get(f"/api/topics/{topic.slug}/questions").json()
+    pyqs = client.get(f"/api/topics/{topic.slug}/pyqs").json()
+    assert [q["id"] for q in samples] == [sample.id]
+    assert [q["id"] for q in pyqs] == [published.id]
+    assert pyqs[0]["source_type"] == "UPSC_PYQ" and pyqs[0]["year"] == 2024
+    assert pyqs[0]["source_url"] == source.source_url
+    assert "correct_option" not in pyqs[0] and "is_correct" not in pyqs[0]["options"][0]
+    assert client.get(f"/api/topics/{topic.slug}").json()["pyq_count"] == 1
+    assert client.post(f"/api/questions/{hidden.id}/attempt", json={"option_id": hidden.options[0].id}).status_code == 404
 
 
 def test_question_attempt_history_is_scoped_to_authenticated_user(harness):

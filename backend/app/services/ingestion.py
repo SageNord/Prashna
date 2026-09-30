@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import logging
+import re
 from threading import Lock
 import time
 
@@ -21,6 +22,18 @@ log = logging.getLogger("prashna.ingestion")
 _run_lock = Lock()
 MAX_CANDIDATES_PER_SOURCE = 40
 MAX_PROCESSED_PER_RUN = 30
+
+
+def _safe_source_error(error: Exception) -> str:
+    """Keep actionable source errors while stripping URLs and credential-like values."""
+    message = str(error) or type(error).__name__
+    message = re.sub(r"https?://[^\s\]\[()]+", "[url]", message, flags=re.IGNORECASE)
+    message = re.sub(
+        r"(?i)\b(authorization|token|secret|password|api[_-]?key)\b\s*([=:])\s*[^\s&,;]+",
+        r"\1\2[redacted]",
+        message,
+    )
+    return message[:240]
 
 
 def _add_alternative_source(db: Session, article: Article, raw: RawArticle, priority: int) -> bool:
@@ -233,8 +246,9 @@ def run_ingestion(run_id: int, session_factory=None) -> None:
                 candidates.extend((item, source) for item in rows)
                 log.info("Ingestion source fetched run_id=%s source=%s candidates=%s", run_id, source.name, len(rows))
             except Exception as exc:
-                errors.append(f"{source.name}: {type(exc).__name__}")
-                log.warning("Ingestion source failed run_id=%s source=%s error_type=%s", run_id, source.name, type(exc).__name__)
+                detail = _safe_source_error(exc)
+                errors.append(f"{source.name}: {detail}")
+                log.warning("Ingestion source failed run_id=%s source=%s reason=%s", run_id, source.name, detail)
         run.candidates = len(candidates)
         db.commit()
         for raw, source in candidates:

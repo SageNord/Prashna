@@ -305,9 +305,20 @@ class Question(Base):
     question_type: Mapped[str] = mapped_column(String(16), default="MCQ", nullable=False)
     source: Mapped[str] = mapped_column(String(200), default="Prashna demo questions", nullable=False)
     is_published: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    source_type: Mapped[str] = mapped_column(String(24), default="SAMPLE", nullable=False)
+    year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    exam: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    stage: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    paper: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    question_number: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    source_document_id: Mapped[int | None] = mapped_column(ForeignKey("source_documents.id", name="fk_questions_source_document_id_source_documents"), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="PUBLISHED", nullable=False)
+    classification_method: Mapped[str] = mapped_column(String(20), default="MANUAL", nullable=False)
+    classification_confidence: Mapped[float | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
     topic: Mapped[Topic] = relationship()
+    source_document: Mapped["SourceDocument | None"] = relationship()
     options: Mapped[list["QuestionOption"]] = relationship(
         back_populates="question", cascade="all, delete-orphan", order_by="QuestionOption.display_order")
 
@@ -330,6 +341,18 @@ class QuestionOption(Base):
     question: Mapped[Question] = relationship(back_populates="options")
 
 
+class QuestionTopicClassification(Base):
+    __tablename__ = "question_topic_classifications"
+    __table_args__ = (UniqueConstraint("question_id", "topic_id", name="uq_question_topic_classifications_pair"),
+                      Index("ix_question_topic_classifications_topic", "topic_id"))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    question_id: Mapped[int] = mapped_column(ForeignKey("questions.id", name="fk_question_topic_classifications_question_id_questions", ondelete="CASCADE"), nullable=False)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id", name="fk_question_topic_classifications_topic_id_topics", ondelete="CASCADE"), nullable=False)
+    classification_method: Mapped[str] = mapped_column(String(20), nullable=False)
+    confidence: Mapped[float | None] = mapped_column(nullable=True)
+    review_status: Mapped[str] = mapped_column(String(20), default="REVIEW", nullable=False)
+
+
 class UserQuestionAttempt(Base):
     __tablename__ = "user_question_attempts"
     __table_args__ = (
@@ -344,3 +367,92 @@ class UserQuestionAttempt(Base):
     attempted_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     question: Mapped[Question] = relationship()
     selected_option: Mapped[QuestionOption] = relationship()
+
+
+# Source-traceable learning pipeline. Raw licensed documents remain outside the
+# repository; only identifiers, extracted text chunks and authored summaries live here.
+class SourceDocument(Base):
+    __tablename__ = "source_documents"
+    __table_args__ = (UniqueConstraint("checksum", name="uq_source_documents_checksum"),
+                      Index("ix_source_documents_status", "ingestion_status"))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    publisher: Mapped[str] = mapped_column(String(200), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    subject_id: Mapped[int | None] = mapped_column(ForeignKey("subjects.id", name="fk_source_documents_subject_id_subjects"), nullable=True)
+    source_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    file_identifier: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    publication_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    version: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    license_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ingestion_status: Mapped[str] = mapped_column(String(20), default="DRAFT", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class SourceDocumentTopic(Base):
+    __tablename__ = "source_document_topics"
+    __table_args__ = (UniqueConstraint("document_id", "topic_id", name="uq_source_document_topics_pair"),
+                      Index("ix_source_document_topics_topic", "topic_id"))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("source_documents.id", name="fk_source_document_topics_document_id_source_documents", ondelete="CASCADE"), nullable=False)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id", name="fk_source_document_topics_topic_id_topics", ondelete="CASCADE"), nullable=False)
+    classification_method: Mapped[str] = mapped_column(String(20), nullable=False)
+    confidence: Mapped[float | None] = mapped_column(nullable=True)
+    review_status: Mapped[str] = mapped_column(String(20), default="REVIEW", nullable=False)
+
+
+class SourceChunk(Base):
+    __tablename__ = "source_chunks"
+    __table_args__ = (UniqueConstraint("document_id", "chunk_index", name="uq_source_chunks_document_index"),
+                      Index("ix_source_chunks_topic", "topic_id"))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("source_documents.id", name="fk_source_chunks_document_id_source_documents", ondelete="CASCADE"), nullable=False)
+    topic_id: Mapped[int | None] = mapped_column(ForeignKey("topics.id", name="fk_source_chunks_topic_id_topics"), nullable=True)
+    page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    section: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class ContentIngestionJob(Base):
+    __tablename__ = "content_ingestion_jobs"
+    __table_args__ = (Index("ix_content_ingestion_jobs_status", "status"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("source_documents.id", name="fk_content_ingestion_jobs_document_id_source_documents", ondelete="CASCADE"), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="QUEUED", nullable=False)
+    phase: Mapped[str] = mapped_column(String(40), default="QUEUED", nullable=False)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    queued_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class LearningCard(Base):
+    __tablename__ = "learning_cards"
+    __table_args__ = (UniqueConstraint("slug", name="uq_learning_cards_slug"),
+                      Index("ix_learning_cards_topic_status_order", "topic_id", "status", "display_order"))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id", name="fk_learning_cards_topic_id_topics", ondelete="CASCADE"), nullable=False)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    slug: Mapped[str] = mapped_column(String(260), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    display_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="REVIEW", nullable=False)
+    content_origin: Mapped[str] = mapped_column(String(24), default="PRASHNA_SUMMARY", nullable=False)
+    classification_method: Mapped[str] = mapped_column(String(20), default="MANUAL", nullable=False)
+    classification_confidence: Mapped[float | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class LearningCardSourceRef(Base):
+    __tablename__ = "learning_card_source_refs"
+    __table_args__ = (UniqueConstraint("card_id", "source_chunk_id", name="uq_learning_card_source_refs_pair"),
+                      Index("ix_learning_card_source_refs_card_order", "card_id", "reference_order"))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    card_id: Mapped[int] = mapped_column(ForeignKey("learning_cards.id", name="fk_learning_card_source_refs_card_id_learning_cards", ondelete="CASCADE"), nullable=False)
+    source_chunk_id: Mapped[int] = mapped_column(ForeignKey("source_chunks.id", name="fk_learning_card_source_refs_source_chunk_id_source_chunks", ondelete="RESTRICT"), nullable=False)
+    reference_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    attribution_note: Mapped[str | None] = mapped_column(String(500), nullable=True)
