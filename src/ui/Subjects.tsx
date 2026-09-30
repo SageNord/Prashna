@@ -5,8 +5,9 @@ import { api } from '../services/api';
 type Subject = { id: number; name: string; slug: string; description: string; icon: string; color: string; topic_count: number; completed_topics: number; progress_percent: number };
 type Topic = { id: number; name: string; slug: string; description: string; completed: boolean };
 type Content = { id: number; title: string; summary: string; body: string; estimated_minutes: number; source: string };
-type TopicDetail = Topic & { subject: { name: string; slug: string }; content: Content[]; children: Topic[]; question_count: number; reading_completed: boolean; practice_attempted: number; practice_completed: boolean; progress_percent: number };
-type PracticeQuestion = { id: number; question_text: string; difficulty: string; question_type: string; source: string; options: { id: number; text: string }[] };
+type ReadingCard = { id: number; title: string; content: string; content_origin: string; sources: { title: string; publisher: string; source_type: string; source_url: string | null; page_number: number | null; section: string | null; attribution_note: string | null }[] };
+type TopicDetail = Topic & { subject: { name: string; slug: string }; content: Content[]; reading_cards: ReadingCard[]; children: Topic[]; question_count: number; pyq_count: number; reading_completed: boolean; practice_attempted: number; practice_completed: boolean; progress_percent: number };
+type PracticeQuestion = { id: number; question_text: string; difficulty: string; question_type: string; source: string; source_type: string; year: number | null; exam: string | null; stage: string | null; paper: string | null; question_number: string | null; source_url: string | null; options: { id: number; text: string }[] };
 
 const icons: Record<string, any> = { newspaper: BookOpen, landmark: Landmark, history: Landmark, 'globe-2': Globe2, 'chart-no-axes-combined': Compass, leaf: Leaf, atom: Atom, palette: Palette, globe: Globe2, users: Users, 'building-2': Building2, shield: Shield, scale: Scale, brain: Brain };
 
@@ -15,6 +16,7 @@ export default function Subjects({ notify, onCurrentAffairs, initialTopicSlug }:
   const [activeSubject, setActiveSubject] = useState<(Subject & { topics: Topic[] }) | null>(null);
   const [activeTopic, setActiveTopic] = useState<TopicDetail | null>(null);
   const [practiceMode, setPracticeMode] = useState(false);
+  const [practiceSource, setPracticeSource] = useState<'SAMPLE' | 'UPSC_PYQ'>('SAMPLE');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -81,21 +83,27 @@ export default function Subjects({ notify, onCurrentAffairs, initialTopicSlug }:
 
   return <section className="learning-page">
     {(activeSubject || activeTopic) && !practiceMode && <button className="learning-back" onClick={back}><ArrowLeft size={16}/>{activeTopic ? activeTopic.subject.name : 'All subjects'}</button>}
-    {activeTopic && practiceMode ? <PracticeFlow topicSlug={activeTopic.slug} topicName={activeTopic.name} readingCompleted={activeTopic.reading_completed} onBack={() => { setPracticeMode(false); void refreshActiveTopic(); }} /> : activeTopic ? <>
+    {activeTopic && practiceMode ? <PracticeFlow topicSlug={activeTopic.slug} topicName={activeTopic.name} sourceType={practiceSource} readingCompleted={activeTopic.reading_completed} onBack={() => { setPracticeMode(false); void refreshActiveTopic(); }} /> : activeTopic ? <>
       <div className="learning-eyebrow">{activeTopic.subject.name.toUpperCase()} · TOPIC</div>
       <div className="learning-title-row"><div><h1>{activeTopic.name}<span className="brand-dot">.</span></h1><p>{activeTopic.description}</p></div><span className={'completion-chip '+(activeTopic.completed?'complete':'')}>{activeTopic.completed ? <><Check size={14}/> Completed</> : 'In progress'}</span></div>
       <div className="topic-progress-panel"><div className="topic-progress-heading"><div><span>LEARNING PROGRESS</span><b>{activeTopic.progress_percent}%</b></div><div className="topic-progress-track"><i style={{ width: `${activeTopic.progress_percent}%` }}/></div></div><div className="topic-progress-states"><span className={activeTopic.reading_completed?'is-done':''}><CheckCircle2 size={15}/> Reading {activeTopic.reading_completed?'complete':'not complete'}</span><span className={activeTopic.practice_completed?'is-done':''}><Brain size={15}/> Practice {activeTopic.practice_attempted}/{activeTopic.question_count}</span></div><small>Progress combines reading completion (50%) and distinct practice questions attempted (50%).</small></div>
-      <div className="topic-learning-actions"><div><b>{activeTopic.content.length} {activeTopic.content.length === 1 ? 'lesson' : 'lessons'}</b><span>{activeTopic.question_count} practice questions available</span></div><div><button className="outline-btn" onClick={() => document.getElementById('topic-lessons')?.scrollIntoView({ behavior: 'smooth' })} disabled={!activeTopic.content.length}>Start learning</button><button className="dark-button" onClick={() => setPracticeMode(true)} disabled={!activeTopic.question_count}>Practice {Math.min(5, activeTopic.question_count)} questions <ChevronRight size={15}/></button></div></div>
-      {!activeTopic.question_count && <div className="learning-inline-error">Practice questions are not available for this topic yet.</div>}
+      <div className="topic-learning-actions"><div><b>{activeTopic.reading_cards.length || activeTopic.content.length} reading {(activeTopic.reading_cards.length || activeTopic.content.length) === 1 ? 'item' : 'items'}</b><span>{activeTopic.pyq_count} verified UPSC PYQs · {activeTopic.question_count - activeTopic.pyq_count} sample questions</span></div><div><button className="outline-btn" onClick={() => document.getElementById('topic-lessons')?.scrollIntoView({ behavior: 'smooth' })} disabled={!activeTopic.reading_cards.length && !activeTopic.content.length}>Start learning</button>{activeTopic.pyq_count > 0 && <button className="dark-button" onClick={() => { setPracticeSource('UPSC_PYQ'); setPracticeMode(true); }}>Attempt UPSC PYQs ({activeTopic.pyq_count}) <ChevronRight size={15}/></button>}{activeTopic.question_count > activeTopic.pyq_count && <button className="outline-btn" onClick={() => { setPracticeSource('SAMPLE'); setPracticeMode(true); }}>Practice sample questions <ChevronRight size={15}/></button>}</div></div>
+      {activeTopic.pyq_count === 0 && <div className="learning-empty pyq-empty"><b>No verified UPSC PYQs have been added for this topic yet.</b><span>Sample questions remain available separately and are not shown as previous-year questions.</span></div>}
       {activeTopic.children.length > 0 && <div className="learning-subtopics">{activeTopic.children.map(child => <button key={child.slug} onClick={() => openTopic(child)}>{child.name}<ChevronRight size={15}/></button>)}</div>}
-      {activeTopic.content.length ? <div id="topic-lessons">{activeTopic.content.map(item => <article className="lesson-card" key={item.id}>
+      {activeTopic.reading_cards.length > 0 && <div className="source-reading-cards" id="topic-lessons">{activeTopic.reading_cards.map(card => <article className="lesson-card" key={`card-${card.id}`}>
+        <div className="lesson-meta"><span className="published-chip">SOURCE-BASED · {card.content_origin.replace(/_/g, ' ')}</span></div>
+        <h2>{card.title}</h2><div className="lesson-body"><p>{card.content}</p></div>
+        {card.sources.map((source, index) => <div className="lesson-source" key={index}>Source: {source.publisher} — {source.title}{source.section ? ` · ${source.section}` : ''}{source.page_number ? ` · Page ${source.page_number}` : ''}{source.attribution_note ? ` · ${source.attribution_note}` : ''}{source.source_url ? <> · <a href={source.source_url} target="_blank" rel="noreferrer">Original source</a></> : ''}</div>)}
+      </article>)}</div>}
+      {!activeTopic.reading_cards.length && activeTopic.content.length ? <div id="topic-lessons">{activeTopic.content.map(item => <article className="lesson-card" key={item.id}>
         <div className="lesson-meta"><span className="demo-chip">DEMO LESSON</span><span><Clock3 size={14}/> {item.estimated_minutes} min</span></div>
         <h2>{item.title}</h2><p className="lesson-summary">{item.summary}</p>
         <div className="lesson-body">{item.body.split(/\n\n+/).map((part, index) => part.startsWith('## ')
           ? <h3 key={index}>{part.slice(3)}</h3>
           : <p key={index}>{part.replace(/\*\*/g, '')}</p>)}</div>
         <div className="lesson-source">{item.source} · Sample content for demonstration; not official UPSC material.</div>
-      </article>)}<button className="learning-complete reading-complete" onClick={markReadingComplete} disabled={activeTopic.reading_completed}>{activeTopic.reading_completed ? <><Check size={17}/> Reading complete</> : <>Mark reading complete <CheckCircle2 size={16}/></>}</button></div> : <div className="learning-empty"><BookOpen size={23}/><b>Learning material is on the way</b><span>This topic is in the catalog. Lessons will be added in a later content phase.</span></div>}
+      </article>)}</div> : null}
+      {activeTopic.content.length + activeTopic.reading_cards.length > 0 ? <button className="learning-complete reading-complete" onClick={markReadingComplete} disabled={activeTopic.reading_completed}>{activeTopic.reading_completed ? <><Check size={17}/> Reading complete</> : <>Mark reading complete <CheckCircle2 size={16}/></>}</button> : <div className="learning-empty"><BookOpen size={23}/><b>Learning material is on the way</b><span>This topic is in the catalog. Lessons will be added in a later content phase.</span></div>}
       <button className="learning-complete" onClick={markComplete} disabled={activeTopic.completed}>{activeTopic.completed ? <><Check size={17}/> Topic completed</> : <>Mark topic complete <ArrowUpRight size={16}/></>}</button>
     </> : activeSubject ? <>
       <div className="learning-eyebrow">SUBJECT · {activeSubject.topic_count} TOPICS</div>
@@ -116,7 +124,7 @@ export default function Subjects({ notify, onCurrentAffairs, initialTopicSlug }:
 type AttemptResult = { attempt_id: number; is_correct: boolean; selected_option_id: number; selected_answer: string; correct_option_id: number; correct_answer: string; explanation: string };
 type SessionAttempt = { question: PracticeQuestion; result: AttemptResult };
 
-function PracticeFlow({ topicSlug, topicName, readingCompleted, onBack }: { topicSlug: string; topicName: string; readingCompleted: boolean; onBack: () => void }) {
+function PracticeFlow({ topicSlug, topicName, sourceType, readingCompleted, onBack }: { topicSlug: string; topicName: string; sourceType: 'SAMPLE' | 'UPSC_PYQ'; readingCompleted: boolean; onBack: () => void }) {
   const [questions, setQuestions] = useState<PracticeQuestion[]>([]);
   const [attempts, setAttempts] = useState<SessionAttempt[]>([]);
   const [index, setIndex] = useState(0);
@@ -132,7 +140,7 @@ function PracticeFlow({ topicSlug, topicName, readingCompleted, onBack }: { topi
     setLoading(true); setError(''); setQuestions([]); setAttempts([]); setIndex(0);
     setSelected(null); setSubmission(null); setReviewMode(false); setShowResults(false);
     try {
-      const rows = await api<PracticeQuestion[]>(`/api/topics/${topicSlug}/questions`);
+      const rows = await api<PracticeQuestion[]>(`/api/topics/${topicSlug}/${sourceType === 'UPSC_PYQ' ? 'pyqs' : 'questions'}`);
       const shuffled = [...rows].sort(() => Math.random() - 0.5).slice(0, 5);
       setQuestions(shuffled);
     } catch (e) { setError(e instanceof Error ? e.message : 'Practice questions could not be loaded.'); }
@@ -171,11 +179,11 @@ function PracticeFlow({ topicSlug, topicName, readingCompleted, onBack }: { topi
       <div className="practice-result-actions"><button className="outline-btn" onClick={() => setReviewMode(true)} disabled={!mistakes.length}>Review mistakes <ChevronRight size={15}/></button><button className="dark-button" onClick={() => void start()}><RotateCcw size={15}/> Practice again</button><button className="practice-back-link" onClick={onBack}>Back to topic</button></div>
     </> : loading ? <div className="learning-loading"><RefreshCw className="spinning"/> Preparing your practice…</div>
       : error && !questions.length ? <div className="learning-error"><AlertCircle size={20}/><b>Practice is unavailable</b><span>{error}</span><button className="outline-btn" onClick={() => void start()}>Try again</button></div>
-      : !questions.length ? <div className="learning-empty"><BookOpen size={22}/><b>No practice questions yet</b><span>Questions for this topic will appear here when they are ready.</span><button className="outline-btn" onClick={onBack}>Back to topic</button></div>
+      : !questions.length ? <div className="learning-empty"><BookOpen size={22}/><b>{sourceType === 'UPSC_PYQ' ? 'No verified UPSC PYQs have been added for this topic yet.' : 'No sample practice questions are available.'}</b><span>{sourceType === 'UPSC_PYQ' ? 'Demo questions are kept separate and will not be substituted here.' : 'Sample questions are labelled separately from official previous-year questions.'}</span><button className="outline-btn" onClick={onBack}>Back to topic</button></div>
       : question && <>
-        <div className="practice-header"><div><div className="learning-eyebrow">PRACTICE · {topicName.toUpperCase()}</div><h1>Question {index + 1}<span> / {questions.length}</span></h1></div><span className="demo-chip">DEMO QUESTIONS</span></div>
+        <div className="practice-header"><div><div className="learning-eyebrow">PRACTICE · {topicName.toUpperCase()}</div><h1>Question {index + 1}<span> / {questions.length}</span></h1></div><span className={question.source_type === 'UPSC_PYQ' ? 'published-chip' : 'demo-chip'}>{question.source_type === 'UPSC_PYQ' ? `UPSC CSE ${question.stage || 'Prelims'} — ${question.year}` : 'SAMPLE PRACTICE QUESTION'}</span></div>
         <div className="practice-progress"><i style={{ width: `${(index + (submission ? 1 : 0)) / questions.length * 100}%` }}/></div>
-        <article className="practice-question-card"><span className="practice-difficulty">{question.difficulty}</span><h2>{question.question_text}</h2><div className="practice-options">{question.options.map((option, optionIndex) => {
+        <article className="practice-question-card"><span className="practice-difficulty">{question.difficulty}</span><h2>{question.question_text}</h2>{question.source_type === 'UPSC_PYQ' && question.source_url && <div className="lesson-source">Official paper: <a href={question.source_url} target="_blank" rel="noreferrer">UPSC {question.year} source</a> · {question.paper} · Q. {question.question_number}</div>}<div className="practice-options">{question.options.map((option, optionIndex) => {
           const isSelected = selected === option.id;
           const isCorrect = submission?.correct_option_id === option.id;
           const isWrongSelection = !!submission && isSelected && !submission.is_correct;

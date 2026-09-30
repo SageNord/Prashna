@@ -135,3 +135,88 @@ python -m app.seed
 # API documentation while the backend is running
 # http://localhost:8000/docs
 ```
+
+## Content ingestion
+
+The source-traceable tables in migration `0007_source_traceable_content` support source documents, extracted chunks, reading cards, reviewable PYQs and publication. Existing demo lessons and sample questions remain in the app and are labelled separately. Run the migration to Alembic head before using these commands.
+
+After migration and catalog setup, seed the idempotent Fundamental Rights example:
+
+```bash
+cd backend
+python -m app.real_content_seed
+```
+
+### Add source files locally
+
+Put original files under the ignored `backend/content/` folder. A subject folder maps to the existing subject slug; a second-level topic folder maps to a topic slug. For example:
+
+```text
+backend/content/
+  polity/fundamental-rights/ncert-rights.pdf
+  history/revolt-of-1857/notes.md
+  geography/indian-monsoon/monsoon.txt
+```
+
+For reliable attribution, add a sibling metadata file named `ncert-rights.pdf.meta.json`:
+
+```json
+{
+  "title": "Indian Constitution at Work — Chapter 2",
+  "publisher": "National Council of Educational Research and Training",
+  "source_type": "NCERT",
+  "source_url": "https://www.ncert.nic.in/textbook/pdf/keps202.pdf",
+  "subject_slug": "indian-polity",
+  "topic_slug": "fundamental-rights",
+  "license_notes": "Link to the official publication; do not redistribute the PDF."
+}
+```
+
+Supported `source_type` values: `NCERT`, `UPSC`, `GOVERNMENT`, `PARLIAMENTARY`, `IGNOU`, `NIOS`, `COACHING`, `NEWS_CURRENT_AFFAIRS`, `OTHER`. Without a sidecar, the filename/folder are used as draft metadata and require review. Do not put copyrighted PDFs in Git.
+
+From the backend directory, scan/register new files and process queued jobs:
+
+```bash
+cd backend
+python -m app.scripts.process_content_jobs
+```
+
+PDF, TXT and Markdown are supported. PDFs retain physical page numbers; TXT/Markdown may use form-feed characters (`\f`) to mark page breaks. Each chunk stores its source document, page and detected section when present. Extraction errors (including scanned PDFs with no text or a missing PDF dependency) leave a failed job with a readable error; after fixing the cause, run `python -m app.scripts.process_content_jobs --retry-failed`. The checksum prevents duplicate registration. Files stay local; the database retains a local identifier, checksum, extracted chunks and attribution metadata.
+
+### Review and publish reading cards
+
+Processing ends in `REVIEW`, never publication. An authenticated admin can inspect extracted pages/text at `GET /api/admin/source-documents/{id}` and the issue summary at `GET /api/admin/content-validation`. Create a Prashna-authored card with the selected chunk IDs at `POST /api/admin/learning-cards`, then publish it only after checking the facts and page attribution with `POST /api/admin/learning-cards/{id}/publish`. The learner topic view returns only published cards, ordered by card order, with publisher, title, section/page and original-source link.
+
+### Import actual UPSC PYQs from JSON
+
+Create a UTF-8 JSON file containing an array. `question_number` may be a string or integer; `correct_option` is **1-based**. Only set `answer_verified: true` after checking the official answer key. If that field is absent/false, the answer is deliberately left unset and the PYQ stays in review.
+
+```json
+[
+  {
+    "year": 2024,
+    "exam": "Civil Services Examination",
+    "stage": "Prelims",
+    "paper": "General Studies Paper I",
+    "question_number": 76,
+    "question_text": "Exact question text copied from the official paper",
+    "options": ["Exact option A", "Exact option B", "Exact option C", "Exact option D"],
+    "correct_option": 4,
+    "answer_verified": true,
+    "explanation": "Explanation kept separate from official question wording.",
+    "subject": "indian-polity",
+    "topic": "fundamental-rights",
+    "official_source_url": "https://www.upsc.gov.in/sites/default/files/QP-CSP-24-GENERAL-STUDIES-PAPER-I-180624.pdf"
+  }
+]
+```
+
+Import it from `backend/`:
+
+```bash
+python -m app.scripts.import_pyqs path/to/questions.json
+```
+
+The importer checks the schema, existing subject/topic, 2–6 non-empty options and HTTPS UPSC source URL; preserves the supplied wording/options; and skips duplicate year/exam/stage/paper/number or exact same-paper text. New PYQs are `REVIEW` and unpublished. An unverified answer is not stored as correct. Review an item at `GET /api/admin/pyqs/{id}`; if needed, enter the checked 1-based answer with `POST /api/admin/pyqs/{id}/answer`, then explicitly publish with `POST /api/admin/questions/{id}/publish`. These routes require the existing admin role. `GET /api/topics/{slug}/pyqs` and the learner UI expose only published UPSC PYQs; `.../questions` contains sample questions separately. The UI shows “No verified UPSC PYQs…” when there are none; sample items are never substituted or labelled as PYQs.
+
+The starter seed defines a small Indian Polity → Fundamental Rights example linked to the official [NCERT chapter](https://www.ncert.nic.in/textbook/pdf/keps202.pdf) and official UPSC 2024 GS-I paper. Larger source ingestion and answer-key verification remain a human task. Avoid redistributing source books/PDFs; use the source link and concise attributed Prashna summaries. Semantic support and contradictory claims require editorial review. Scanned PDFs need OCR before they can be processed.
